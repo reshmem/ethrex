@@ -51,7 +51,7 @@ mod tests {
     async fn test_for_legacy_txs() {
         let context = default_context().await;
 
-        add_legacy_tx_blocks(&context.storage, 100, 10).await;
+        add_legacy_tx_blocks(&context.storage, 21, 3).await;
 
         let gas_price = MaxPriorityFee {};
         let response = gas_price.handle(context).await.unwrap();
@@ -63,7 +63,7 @@ mod tests {
     async fn test_for_eip_1559_txs() {
         let context = default_context().await;
 
-        add_eip1559_tx_blocks(&context.storage, 100, 10).await;
+        add_eip1559_tx_blocks(&context.storage, 21, 3).await;
 
         let gas_price = MaxPriorityFee {};
         let response = gas_price.handle(context).await.unwrap();
@@ -75,7 +75,7 @@ mod tests {
     async fn test_with_mixed_transactions() {
         let context = default_context().await;
 
-        add_mixed_tx_blocks(&context.storage, 100, 10).await;
+        add_mixed_tx_blocks(&context.storage, 21, 3).await;
 
         let gas_price = MaxPriorityFee {};
         let response = gas_price.handle(context).await.unwrap();
@@ -87,7 +87,7 @@ mod tests {
     async fn test_with_not_enough_blocks_or_transactions() {
         let context = default_context().await;
 
-        add_mixed_tx_blocks(&context.storage, 100, 0).await;
+        add_mixed_tx_blocks(&context.storage, 21, 0).await;
 
         let gas_price = MaxPriorityFee {};
         let response = gas_price.handle(context).await.unwrap();
@@ -118,7 +118,7 @@ mod tests {
         let mut context = default_context().await;
         context.node_data.local_p2p_node = example_p2p_node();
 
-        add_eip1559_tx_blocks(&context.storage, 100, 3).await;
+        add_eip1559_tx_blocks(&context.storage, 21, 3).await;
 
         let response = map_http_requests(&request, context).await.unwrap();
         assert_eq!(response, expected_response)

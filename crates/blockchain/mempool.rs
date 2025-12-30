@@ -486,7 +486,7 @@ mod tests {
     use super::transaction_intrinsic_gas;
     use ethrex_common::types::{
         BYTES_PER_BLOB, BlobsBundle, BlockHeader, ChainConfig, EIP1559Transaction,
-        EIP4844Transaction, MempoolTransaction, Transaction, TxKind,
+        EIP4844Transaction, MempoolTransaction, Transaction, TxKind, TxType,
     };
     use ethrex_common::{Address, Bytes, H256, U256};
     use ethrex_storage::EngineType;
@@ -841,11 +841,81 @@ mod tests {
 
     #[test]
     fn test_filter_mempool_transactions() {
-        let plain_tx_decoded = Transaction::decode_canonical(&hex::decode("f86d80843baa0c4082f618946177843db3138ae69679a54b95cf345ed759450d870aa87bee538000808360306ba0151ccc02146b9b11adf516e6787b59acae3e76544fdcd75e77e67c6b598ce65da064c5dd5aae2fbb535830ebbdad0234975cd7ece3562013b63ea18cc0df6c97d4").unwrap()).unwrap();
-        let plain_tx_sender = plain_tx_decoded.sender().unwrap();
+        use ethrex_common::types::{EIP4844Transaction, TxKind};
+        use ethrex_crypto::slh_dsa::{generate_slh_key, slh_sign};
+        use ethrex_rlp::structs::Encoder;
+
+        let (sk, _pk) = generate_slh_key();
+
+        let mut legacy_tx = ethrex_common::types::LegacyTransaction {
+            nonce: 0,
+            gas_price: U256::from(1),
+            gas: 21_000,
+            to: TxKind::Call(Address::from_low_u64_be(1)),
+            value: U256::zero(),
+            data: Bytes::new(),
+            v: U256::from(1),
+            sig: Bytes::new(),
+            ..Default::default()
+        };
+
+        let mut legacy_payload = vec![];
+        Encoder::new(&mut legacy_payload)
+            .encode_field(&legacy_tx.nonce)
+            .encode_field(&legacy_tx.gas_price)
+            .encode_field(&legacy_tx.gas)
+            .encode_field(&legacy_tx.to)
+            .encode_field(&legacy_tx.value)
+            .encode_field(&legacy_tx.data)
+            .encode_field(&legacy_tx.v)
+            .encode_field(&0u8)
+            .encode_field(&0u8)
+            .finish();
+        let legacy_hash = ethrex_common::utils::keccak(&legacy_payload);
+        let legacy_sig = slh_sign(legacy_hash.as_bytes(), &sk).expect("signing should succeed");
+        legacy_tx.sig = Bytes::from(legacy_sig.as_bytes().to_vec());
+
+        let plain_tx_decoded = Transaction::LegacyTransaction(legacy_tx);
+        let plain_tx_sender = plain_tx_decoded.sender().expect("recover sender");
         let plain_tx = MempoolTransaction::new(plain_tx_decoded, plain_tx_sender);
-        let blob_tx_decoded = Transaction::decode_canonical(&hex::decode("03f88f0780843b9aca008506fc23ac00830186a09400000000000000000000000000000000000001008080c001e1a0010657f37554c781402a22917dee2f75def7ab966d7b770905398eba3c44401401a0840650aa8f74d2b07f40067dc33b715078d73422f01da17abdbd11e02bbdfda9a04b2260f6022bf53eadb337b3e59514936f7317d872defb891a708ee279bdca90").unwrap()).unwrap();
-        let blob_tx_sender = blob_tx_decoded.sender().unwrap();
+
+        let mut blob_tx = EIP4844Transaction {
+            chain_id: 1,
+            nonce: 0,
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 1,
+            gas: 21_000,
+            to: Address::from_low_u64_be(1),
+            value: U256::zero(),
+            data: Bytes::new(),
+            access_list: Default::default(),
+            max_fee_per_blob_gas: U256::from(1),
+            blob_versioned_hashes: vec![H256::zero()],
+            v: U256::from(1),
+            sig: Bytes::new(),
+            ..Default::default()
+        };
+
+        let mut blob_payload = vec![TxType::EIP4844 as u8];
+        Encoder::new(&mut blob_payload)
+            .encode_field(&blob_tx.chain_id)
+            .encode_field(&blob_tx.nonce)
+            .encode_field(&blob_tx.max_priority_fee_per_gas)
+            .encode_field(&blob_tx.max_fee_per_gas)
+            .encode_field(&blob_tx.gas)
+            .encode_field(&blob_tx.to)
+            .encode_field(&blob_tx.value)
+            .encode_field(&blob_tx.data)
+            .encode_field(&blob_tx.access_list)
+            .encode_field(&blob_tx.max_fee_per_blob_gas)
+            .encode_field(&blob_tx.blob_versioned_hashes)
+            .finish();
+        let blob_hash = ethrex_common::utils::keccak(&blob_payload);
+        let blob_sig = slh_sign(blob_hash.as_bytes(), &sk).expect("signing should succeed");
+        blob_tx.sig = Bytes::from(blob_sig.as_bytes().to_vec());
+
+        let blob_tx_decoded = Transaction::EIP4844Transaction(blob_tx);
+        let blob_tx_sender = blob_tx_decoded.sender().expect("recover sender");
         let blob_tx = MempoolTransaction::new(blob_tx_decoded, blob_tx_sender);
         let plain_tx_hash = plain_tx.hash();
         let blob_tx_hash = blob_tx.hash();

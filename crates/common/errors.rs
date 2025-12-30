@@ -16,4 +16,6 @@ pub enum EcdsaError {
     ))]
     #[error("k256 error: {0}")]
     K256(#[from] k256::ecdsa::Error),
+    #[error("slh-dsa error: {0}")]
+    SlhDsa(#[from] ethrex_crypto::slh_dsa::SlhError),
 }

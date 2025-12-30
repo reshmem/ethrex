@@ -12,6 +12,7 @@ use ethrex_l2::{
         utils::resolve_aligned_network,
     },
 };
+use ethrex_l2_common::{account_key::AccountPrivateKey, keystore::AccountKeystore};
 use ethrex_l2_rpc::signer::{LocalSigner, RemoteSigner, Signer};
 use ethrex_prover_lib::{backend::Backend, config::ProverConfig};
 use ethrex_rpc::clients::eth::{
@@ -21,6 +22,7 @@ use reqwest::Url;
 use secp256k1::{PublicKey, SecretKey};
 use std::{
     net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
     str::FromStr,
 };
 use tracing::Level;
@@ -42,8 +44,35 @@ pub struct Options {
     )]
     pub sponsorable_addresses_file_path: Option<String>,
     //TODO: make optional when the the sponsored feature is complete
-    #[arg(long, default_value = "0xffd790338a2798b648806fc8635ac7bf14af15425fed0c8f25bcc5febaa9b192", value_parser = utils::parse_private_key, env = "SPONSOR_PRIVATE_KEY", help = "The private key of ethrex L2 transactions sponsor.", help_heading = "L2 options")]
-    pub sponsor_private_key: SecretKey,
+    #[arg(
+        long,
+        default_value = "0xffd790338a2798b648806fc8635ac7bf14af15425fed0c8f25bcc5febaa9b192",
+        value_parser = utils::parse_account_key,
+        env = "SPONSOR_PRIVATE_KEY",
+        help = "The private key of ethrex L2 transactions sponsor.",
+        help_heading = "L2 options",
+        conflicts_with = "sponsor_keystore_path"
+    )]
+    pub sponsor_private_key: Option<AccountPrivateKey>,
+    #[arg(
+        long = "sponsor-keystore-path",
+        value_name = "SPONSOR_KEYSTORE_PATH",
+        env = "SPONSOR_KEYSTORE_PATH",
+        help = "Path to a sponsor SLH keystore JSON file.",
+        help_heading = "L2 options",
+        conflicts_with = "sponsor_private_key",
+        requires = "sponsor_keystore_password"
+    )]
+    pub sponsor_keystore_path: Option<PathBuf>,
+    #[arg(
+        long = "sponsor-keystore-password",
+        value_name = "SPONSOR_KEYSTORE_PASSWORD",
+        env = "SPONSOR_KEYSTORE_PASSWORD",
+        help = "Password to decrypt the sponsor keystore.",
+        help_heading = "L2 options",
+        requires = "sponsor_keystore_path"
+    )]
+    pub sponsor_keystore_password: Option<String>,
 }
 
 impl Default for Options {
@@ -52,10 +81,12 @@ impl Default for Options {
             node_opts: NodeOptions::default(),
             sequencer_opts: SequencerOptions::default(),
             sponsorable_addresses_file_path: None,
-            sponsor_private_key: utils::parse_private_key(
+            sponsor_private_key: utils::parse_account_key(
                 "0xffd790338a2798b648806fc8635ac7bf14af15425fed0c8f25bcc5febaa9b192",
             )
-            .unwrap(),
+            .ok(),
+            sponsor_keystore_path: None,
+            sponsor_keystore_password: None,
         }
     }
 }
@@ -111,6 +142,8 @@ pub struct SequencerOptions {
 
 pub fn parse_signer(
     private_key: Option<SecretKey>,
+    keystore_path: Option<PathBuf>,
+    keystore_password: Option<String>,
     url: Option<Url>,
     public_key: Option<PublicKey>,
 ) -> Result<Signer, SequencerOptionsError> {
@@ -120,10 +153,29 @@ pub fn parse_signer(
             public_key.ok_or(SequencerOptionsError::RemoteUrlWithoutPubkey)?,
         )
         .into(),
-        None => LocalSigner::new(private_key.ok_or(SequencerOptionsError::NoSigner(
-            "ProofCoordinator".to_string(),
-        ))?)
-        .into(),
+        None => {
+            let key = if let Some(path) = keystore_path {
+                let password = keystore_password
+                    .as_deref()
+                    .ok_or(SequencerOptionsError::MissingSignerKeystorePassword)?;
+                let keystore = AccountKeystore::read_from_file(&path)
+                    .map_err(|e| SequencerOptionsError::InvalidKeystore(e.to_string()))?;
+                let account_key = keystore
+                    .decrypt_account_key(password)
+                    .map_err(|e| SequencerOptionsError::InvalidKeystore(e.to_string()))?;
+                if account_key.legacy_secp_bytes().is_none() {
+                    return Err(SequencerOptionsError::NonLegacySignerKey);
+                }
+                account_key
+            } else {
+                AccountPrivateKey::from(
+                    private_key.ok_or(SequencerOptionsError::NoSigner(
+                        "ProofCoordinator".to_string(),
+                    ))?,
+                )
+            };
+            LocalSigner::new(key).into()
+        }
     })
 }
 
@@ -133,12 +185,22 @@ pub enum SequencerOptionsError {
     RemoteUrlWithoutPubkey,
     #[error("No signer was set up for {0}")]
     NoSigner(String),
+    #[error("Missing signer keystore password")]
+    MissingSignerKeystorePassword,
     #[error("No coinbase address was provided")]
     NoCoinbaseAddress,
     #[error("No on-chain proposer address was provided")]
     NoOnChainProposerAddress,
     #[error("No bridge address was provided")]
     NoBridgeAddress,
+    #[error("Missing sponsor key")]
+    MissingSponsorKey,
+    #[error("Missing sponsor keystore password")]
+    MissingSponsorKeystorePassword,
+    #[error("Invalid keystore: {0}")]
+    InvalidKeystore(String),
+    #[error("Signer keystore must contain a legacy secp256k1 key")]
+    NonLegacySignerKey,
 }
 
 impl TryFrom<SequencerOptions> for SequencerConfig {
@@ -147,12 +209,20 @@ impl TryFrom<SequencerOptions> for SequencerConfig {
     fn try_from(opts: SequencerOptions) -> Result<Self, Self::Error> {
         let committer_signer = parse_signer(
             opts.committer_opts.committer_l1_private_key,
+            opts.committer_opts.committer_l1_keystore_path.clone(),
+            opts.committer_opts.committer_l1_keystore_password.clone(),
             opts.committer_opts.committer_remote_signer_url,
             opts.committer_opts.committer_remote_signer_public_key,
         )?;
 
         let proof_coordinator_signer = parse_signer(
             opts.proof_coordinator_opts.proof_coordinator_l1_private_key,
+            opts.proof_coordinator_opts
+                .proof_coordinator_l1_keystore_path
+                .clone(),
+            opts.proof_coordinator_opts
+                .proof_coordinator_l1_keystore_password
+                .clone(),
             opts.proof_coordinator_opts.remote_signer_url,
             opts.proof_coordinator_opts.remote_signer_public_key,
         )?;
@@ -262,8 +332,31 @@ impl Options {
             .sponsorable_addresses_file_path
             .clone()
             .or(defaults.sponsorable_addresses_file_path.clone());
+        if self.sponsor_keystore_path.is_none() {
+            self.sponsor_private_key =
+                self.sponsor_private_key.clone().or(defaults.sponsor_private_key);
+        }
         self.sequencer_opts
             .populate_with_defaults(&defaults.sequencer_opts);
+    }
+}
+
+impl Options {
+    pub fn resolve_sponsor_key(&self) -> Result<AccountPrivateKey, SequencerOptionsError> {
+        if let Some(path) = &self.sponsor_keystore_path {
+            let password = self
+                .sponsor_keystore_password
+                .as_deref()
+                .ok_or(SequencerOptionsError::MissingSponsorKeystorePassword)?;
+            let keystore = AccountKeystore::read_from_file(path)
+                .map_err(|e| SequencerOptionsError::InvalidKeystore(e.to_string()))?;
+            return keystore
+                .decrypt_account_key(password)
+                .map_err(|e| SequencerOptionsError::InvalidKeystore(e.to_string()));
+        }
+        self.sponsor_private_key
+            .clone()
+            .ok_or(SequencerOptionsError::MissingSponsorKey)
     }
 }
 
@@ -577,10 +670,32 @@ pub struct CommitterOptions {
         help_heading = "L1 Committer options",
         help = "Private key of a funded account that the sequencer will use to send commit txs to the L1.",
         conflicts_with_all = &["committer_remote_signer_url", "committer_remote_signer_public_key"],
-        required_unless_present = "committer_remote_signer_url",
-        required_unless_present = "dev"
+        required_unless_present_any = ["committer_remote_signer_url", "committer_l1_keystore_path", "dev"]
     )]
     pub committer_l1_private_key: Option<SecretKey>,
+    #[arg(
+        long = "committer.l1-keystore-path",
+        value_name = "KEYSTORE_PATH",
+        env = "ETHREX_COMMITTER_L1_KEYSTORE_PATH",
+        help_heading = "L1 Committer options",
+        help = "Path to a keystore JSON for the committer account (legacy secp256k1).",
+        conflicts_with_all = &[
+            "committer_l1_private_key",
+            "committer_remote_signer_url",
+            "committer_remote_signer_public_key"
+        ],
+        requires = "committer_l1_keystore_password"
+    )]
+    pub committer_l1_keystore_path: Option<PathBuf>,
+    #[arg(
+        long = "committer.l1-keystore-password",
+        value_name = "KEYSTORE_PASSWORD",
+        env = "ETHREX_COMMITTER_L1_KEYSTORE_PASSWORD",
+        help_heading = "L1 Committer options",
+        help = "Password to decrypt the committer keystore.",
+        requires = "committer_l1_keystore_path"
+    )]
+    pub committer_l1_keystore_password: Option<String>,
     #[arg(
         long = "committer.remote-signer-url",
         value_name = "URL",
@@ -588,8 +703,7 @@ pub struct CommitterOptions {
         help_heading = "L1 Committer options",
         help = "URL of a Web3Signer-compatible server to remote sign instead of a local private key.",
         requires = "committer_remote_signer_public_key",
-        required_unless_present = "committer_l1_private_key",
-        required_unless_present = "dev"
+        required_unless_present_any = ["committer_l1_private_key", "committer_l1_keystore_path", "dev"]
     )]
     pub committer_remote_signer_url: Option<Url>,
     #[arg(
@@ -652,6 +766,8 @@ impl Default for CommitterOptions {
                 "0x385c546456b6a603a1cfcaa9ec9494ba4832da08dd6bcf4de9a71e4a01b74924",
             )
             .ok(),
+            committer_l1_keystore_path: None,
+            committer_l1_keystore_password: None,
             on_chain_proposer_address: None,
             commit_time_ms: 60000,
             batch_gas_limit: None,
@@ -665,11 +781,17 @@ impl Default for CommitterOptions {
 
 impl CommitterOptions {
     fn populate_with_defaults(&mut self, defaults: &Self) {
-        if self.committer_remote_signer_url.is_none() {
+        if self.committer_remote_signer_url.is_none()
+            && self.committer_l1_keystore_path.is_none()
+        {
             self.committer_l1_private_key = self
                 .committer_l1_private_key
                 .or(defaults.committer_l1_private_key);
         }
+        self.committer_l1_keystore_path = self
+            .committer_l1_keystore_path
+            .clone()
+            .or(defaults.committer_l1_keystore_path.clone());
         self.committer_remote_signer_url = self
             .committer_remote_signer_url
             .clone()
@@ -697,10 +819,32 @@ pub struct ProofCoordinatorOptions {
         help_heading = "Proof coordinator options",
         long_help = "Private key of of a funded account that the sequencer will use to send verify txs to the L1. Has to be a different account than --committer-l1-private-key.",
         conflicts_with_all = &["remote_signer_url", "remote_signer_public_key"],
-        required_unless_present = "remote_signer_url",
-        required_unless_present = "dev"
+        required_unless_present_any = ["remote_signer_url", "proof_coordinator_l1_keystore_path", "dev"]
     )]
     pub proof_coordinator_l1_private_key: Option<SecretKey>,
+    #[arg(
+        long = "proof-coordinator.l1-keystore-path",
+        value_name = "KEYSTORE_PATH",
+        env = "ETHREX_PROOF_COORDINATOR_L1_KEYSTORE_PATH",
+        help_heading = "Proof coordinator options",
+        help = "Path to a keystore JSON for the proof coordinator account (legacy secp256k1).",
+        conflicts_with_all = &[
+            "proof_coordinator_l1_private_key",
+            "remote_signer_url",
+            "remote_signer_public_key"
+        ],
+        requires = "proof_coordinator_l1_keystore_password"
+    )]
+    pub proof_coordinator_l1_keystore_path: Option<PathBuf>,
+    #[arg(
+        long = "proof-coordinator.l1-keystore-password",
+        value_name = "KEYSTORE_PASSWORD",
+        env = "ETHREX_PROOF_COORDINATOR_L1_KEYSTORE_PASSWORD",
+        help_heading = "Proof coordinator options",
+        help = "Password to decrypt the proof coordinator keystore.",
+        requires = "proof_coordinator_l1_keystore_path"
+    )]
+    pub proof_coordinator_l1_keystore_password: Option<String>,
     #[arg(
         long = "proof-coordinator.tdx-private-key",
         value_name = "PRIVATE_KEY",
@@ -727,8 +871,7 @@ pub struct ProofCoordinatorOptions {
         help_heading = "Proof coordinator options",
         help = "URL of a Web3Signer-compatible server to remote sign instead of a local private key.",
         requires = "remote_signer_public_key",
-        required_unless_present = "proof_coordinator_l1_private_key",
-        required_unless_present = "dev"
+        required_unless_present_any = ["proof_coordinator_l1_private_key", "proof_coordinator_l1_keystore_path", "dev"]
     )]
     pub remote_signer_url: Option<Url>,
     #[arg(
@@ -779,6 +922,8 @@ impl Default for ProofCoordinatorOptions {
             remote_signer_url: None,
             remote_signer_public_key: None,
             proof_coordinator_l1_private_key,
+            proof_coordinator_l1_keystore_path: None,
+            proof_coordinator_l1_keystore_password: None,
             listen_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             listen_port: 3900,
             proof_send_interval_ms: 5000,
@@ -792,11 +937,17 @@ impl Default for ProofCoordinatorOptions {
 
 impl ProofCoordinatorOptions {
     fn populate_with_defaults(&mut self, defaults: &Self) {
-        if self.remote_signer_url.is_none() {
+        if self.remote_signer_url.is_none()
+            && self.proof_coordinator_l1_keystore_path.is_none()
+        {
             self.proof_coordinator_l1_private_key = self
                 .proof_coordinator_l1_private_key
                 .or(defaults.proof_coordinator_l1_private_key);
         }
+        self.proof_coordinator_l1_keystore_path = self
+            .proof_coordinator_l1_keystore_path
+            .clone()
+            .or(defaults.proof_coordinator_l1_keystore_path.clone());
         self.proof_coordinator_tdx_private_key = self
             .proof_coordinator_tdx_private_key
             .or(defaults.proof_coordinator_tdx_private_key);

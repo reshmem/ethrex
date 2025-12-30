@@ -1778,6 +1778,16 @@ pub fn validate_block(
     validate_block_header(&block.header, parent_header, elasticity_multiplier)
         .map_err(InvalidBlockError::from)?;
 
+    let max_txs_per_block = chain_config.max_txs_per_block as usize;
+    if block.body.transactions.len() > max_txs_per_block {
+        return Err(error::ChainError::InvalidBlock(
+            InvalidBlockError::ExceededMaxTransactionsPerBlock {
+                max: chain_config.max_txs_per_block,
+                got: block.body.transactions.len() as u64,
+            },
+        ));
+    }
+
     if chain_config.is_osaka_activated(block.header.timestamp) {
         let block_rlp_size = block.length();
         if block_rlp_size > MAX_RLP_BLOCK_SIZE as usize {
@@ -1947,4 +1957,107 @@ fn collapse_root_node(
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use crate::error::{ChainError, InvalidBlockError};
+    use ethrex_common::{
+        Address, Bytes, H256, U256,
+        constants::DEFAULT_OMMERS_HASH,
+        types::{
+            Block, BlockBody, BlockHeader, ChainConfig, EIP1559Transaction, Transaction, TxKind,
+            calculate_base_fee_per_gas, compute_transactions_root, ELASTICITY_MULTIPLIER,
+            INITIAL_BASE_FEE,
+        },
+    };
+
+    use super::validate_block;
+
+    fn build_parent_header() -> BlockHeader {
+        let gas_limit = 30_000_000;
+        let gas_used = gas_limit / ELASTICITY_MULTIPLIER;
+
+        BlockHeader {
+            parent_hash: H256::zero(),
+            ommers_hash: *DEFAULT_OMMERS_HASH,
+            number: 0,
+            timestamp: 1,
+            gas_limit,
+            gas_used,
+            base_fee_per_gas: Some(INITIAL_BASE_FEE),
+            ..Default::default()
+        }
+    }
+
+    fn build_block_with_txs(count: usize) -> (Block, BlockHeader, ChainConfig) {
+        let parent_header = build_parent_header();
+        let transactions = (0..count)
+            .map(|nonce| {
+                Transaction::EIP1559Transaction(EIP1559Transaction {
+                    chain_id: 1,
+                    nonce: nonce as u64,
+                    gas_limit: 21_000,
+                    to: TxKind::Call(Address::zero()),
+                    value: U256::zero(),
+                    data: Bytes::new(),
+                    access_list: Vec::new(),
+                    v: U256::zero(),
+                    sig: Bytes::from(vec![0u8; 1]),
+                    ..Default::default()
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = BlockBody {
+            transactions,
+            ommers: Vec::new(),
+            withdrawals: None,
+        };
+        let transactions_root = compute_transactions_root(&body.transactions);
+        let base_fee_per_gas = calculate_base_fee_per_gas(
+            parent_header.gas_limit,
+            parent_header.gas_limit,
+            parent_header.gas_used,
+            parent_header.base_fee_per_gas.unwrap_or(INITIAL_BASE_FEE),
+            ELASTICITY_MULTIPLIER,
+        )
+        .expect("base fee should be computable for test headers");
+        let header = BlockHeader {
+            parent_hash: parent_header.hash(),
+            ommers_hash: *DEFAULT_OMMERS_HASH,
+            number: parent_header.number + 1,
+            timestamp: parent_header.timestamp + 1,
+            gas_limit: parent_header.gas_limit,
+            gas_used: 0,
+            base_fee_per_gas: Some(base_fee_per_gas),
+            transactions_root,
+            ..Default::default()
+        };
+
+        (Block::new(header, body), parent_header, ChainConfig::default())
+    }
+
+    #[test]
+    fn validate_block_rejects_too_many_txs() {
+        let max_txs = ChainConfig::default().max_txs_per_block as usize;
+        let (block, parent_header, chain_config) = build_block_with_txs(max_txs + 1);
+        let result = validate_block(&block, &parent_header, &chain_config, ELASTICITY_MULTIPLIER);
+
+        match result {
+            Err(ChainError::InvalidBlock(InvalidBlockError::ExceededMaxTransactionsPerBlock {
+                max,
+                got,
+            })) => {
+                assert_eq!(max, chain_config.max_txs_per_block);
+                assert_eq!(got, (max_txs + 1) as u64);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_block_accepts_max_txs() {
+        let max_txs = ChainConfig::default().max_txs_per_block as usize;
+        let (block, parent_header, chain_config) = build_block_with_txs(max_txs);
+        let result = validate_block(&block, &parent_header, &chain_config, ELASTICITY_MULTIPLIER);
+
+        assert!(result.is_ok());
+    }
+}

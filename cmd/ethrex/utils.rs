@@ -151,6 +151,15 @@ pub fn parse_public_key(s: &str) -> eyre::Result<PublicKey> {
     Ok(PublicKey::from_slice(&parse_hex(s)?)?)
 }
 
+#[cfg(feature = "l2")]
+pub fn parse_account_key(s: &str) -> eyre::Result<ethrex_l2_common::account_key::AccountPrivateKey>
+{
+    let bytes = parse_hex(s)?;
+    let key = ethrex_l2_common::account_key::AccountPrivateKey::from_bytes(&bytes)
+        .map_err(|e| eyre::eyre!("Invalid account key: {e}"))?;
+    Ok(key)
+}
+
 pub fn parse_hex(s: &str) -> eyre::Result<Bytes, FromHexError> {
     match s.strip_prefix("0x") {
         Some(s) => hex::decode(s).map(Into::into),

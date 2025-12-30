@@ -116,3 +116,47 @@ impl SendRawTransactionRequest {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use ethrex_common::{Address, U256};
+    use ethrex_common::types::{EIP1559Transaction, Transaction, TxKind, TxType};
+    use ethrex_crypto::slh_dsa::{generate_slh_key, slh_sign};
+    use ethrex_rlp::encode::PayloadRLPEncode;
+
+    #[test]
+    fn decode_canonical_accepts_slh_signature() {
+        let mut tx = EIP1559Transaction {
+            nonce: 1,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 2,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::zero()),
+            value: U256::zero(),
+            data: Bytes::new(),
+            access_list: Vec::new(),
+            chain_id: 1,
+            v: U256::from(1u64),
+            sig: Bytes::new(),
+            ..Default::default()
+        };
+        let mut payload = vec![TxType::EIP1559 as u8];
+        payload.append(tx.encode_payload_to_vec().as_mut());
+        let (sk, _pk) = generate_slh_key();
+        let sig = slh_sign(ethrex_common::utils::keccak(&payload).as_bytes(), &sk)
+            .expect("sign");
+        tx.sig = Bytes::from(sig.as_bytes().to_vec());
+
+        let raw = Transaction::EIP1559Transaction(tx.clone()).encode_canonical_to_vec();
+        let decoded = SendRawTransactionRequest::decode_canonical(&raw)
+            .expect("decode canonical should succeed");
+        match decoded {
+            SendRawTransactionRequest::EIP1559(decoded_tx) => {
+                assert_eq!(decoded_tx.sig, tx.sig);
+            }
+            _ => panic!("unexpected tx type"),
+        }
+    }
+}

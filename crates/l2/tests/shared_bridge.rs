@@ -99,6 +99,12 @@ pub fn read_env_file_by_config() {
 
 #[tokio::test]
 async fn test_shared_bridge() -> Result<()> {
+    read_env_file_by_config();
+    if std::env::var("ETHREX_RUN_L2_INTEGRATION_TESTS").is_err() {
+        eprintln!("ETHREX_RUN_L2_INTEGRATION_TESTS not set, skipping");
+        return Ok(());
+    }
+
     test_counter().await?;
 
     test_transfer_erc_20().await?;
@@ -488,6 +494,10 @@ async fn test_forced_inclusion() {
     // is unable to advance its lastVerifiedBatch.
     // This test assumes that all the necessary setup has been done to have L2A ignoring messages from L2B
     read_env_file_by_config();
+    if std::env::var("ETHREX_RUN_L2_INTEGRATION_TESTS").is_err() {
+        eprintln!("ETHREX_RUN_L2_INTEGRATION_TESTS not set, skipping");
+        return;
+    }
     let l2a_client = connect(L2A_RPC_URL).await;
     let l2b_client = connect(L2B_RPC_URL).await;
 

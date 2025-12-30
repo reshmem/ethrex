@@ -103,6 +103,10 @@ const DEFAULT_TEST_KEYS_FILE_PATH: &str = "../../fixtures/keys/private_keys_test
 #[tokio::test]
 async fn l2_integration_test() -> Result<(), Box<dyn std::error::Error>> {
     read_env_file_by_config();
+    if std::env::var("ETHREX_RUN_L2_INTEGRATION_TESTS").is_err() {
+        eprintln!("ETHREX_RUN_L2_INTEGRATION_TESTS not set, skipping");
+        return Ok(());
+    }
     let mut private_keys = get_tests_private_keys();
 
     let l1_client = l1_client();

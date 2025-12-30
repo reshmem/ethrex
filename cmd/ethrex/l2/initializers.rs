@@ -48,9 +48,10 @@ fn init_rpc_api(
     rollup_store: StoreRollup,
     log_filter_handler: Option<reload::Handle<EnvFilter, Registry>>,
     gas_ceil: Option<u64>,
-) {
+) -> eyre::Result<()> {
     init_datadir(&opts.datadir);
 
+    let sponsor_key = l2_opts.resolve_sponsor_key()?;
     let rpc_api = ethrex_l2_rpc::start_api(
         get_http_socket_addr(opts),
         get_authrpc_socket_addr(opts),
@@ -63,13 +64,14 @@ fn init_rpc_api(
         peer_handler,
         get_client_version(),
         get_valid_delegation_addresses(l2_opts),
-        l2_opts.sponsor_private_key,
+        sponsor_key,
         rollup_store,
         log_filter_handler,
         gas_ceil.unwrap_or(DEFAULT_BUILDER_GAS_CEIL),
     );
 
     tracker.spawn(rpc_api);
+    Ok(())
 }
 
 fn get_valid_delegation_addresses(l2_opts: &L2Options) -> Vec<Address> {
@@ -312,7 +314,7 @@ pub async fn init_l2(
         rollup_store.clone(),
         log_filter_handler,
         Some(opts.sequencer_opts.block_producer_opts.block_gas_limit),
-    );
+    )?;
 
     // Initialize metrics if enabled
     if opts.node_opts.metrics_enabled {

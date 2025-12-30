@@ -572,7 +572,7 @@ impl PeerHandler {
     pub async fn request_block_bodies(
         &mut self,
         block_headers: &[BlockHeader],
-    ) -> Result<Option<Vec<BlockBody>>, PeerHandlerError> {
+    ) -> Result<Option<Vec<(BlockHeader, BlockBody)>>, PeerHandlerError> {
         let block_hashes: Vec<H256> = block_headers.iter().map(|h| h.hash()).collect();
 
         for _ in 0..REQUEST_RETRY_ATTEMPTS {
@@ -583,19 +583,34 @@ impl PeerHandler {
             };
             let mut res = Vec::new();
             let mut validation_success = true;
-            for (header, body) in block_headers[..block_bodies.len()].iter().zip(block_bodies) {
-                if let Err(e) = validate_block_body(header, &body) {
+            let mut header_index = 0usize;
+            for body in block_bodies {
+                let mut matched = false;
+                while header_index < block_headers.len() {
+                    let header = &block_headers[header_index];
+                    header_index += 1;
+                    if let Err(e) = validate_block_body(header, &body) {
+                        trace!(
+                            "Block body did not match header hash={:#x}: {e}",
+                            header.hash()
+                        );
+                        continue;
+                    }
+                    res.push((header.clone(), body));
+                    matched = true;
+                    break;
+                }
+                if !matched {
                     warn!(
-                        "Invalid block body error {e}, discarding peer {peer_id} and retrying..."
+                        "Invalid block bodies response, discarding peer {peer_id} and retrying..."
                     );
                     validation_success = false;
                     self.peer_table.record_critical_failure(&peer_id).await?;
                     break;
                 }
-                res.push(body);
             }
             // Retry on validation failure
-            if validation_success {
+            if validation_success && !res.is_empty() {
                 return Ok(Some(res));
             }
         }

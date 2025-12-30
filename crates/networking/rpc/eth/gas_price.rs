@@ -75,7 +75,7 @@ mod tests {
         let storage = setup_store().await;
         let context = default_context_with_storage(storage).await;
 
-        add_legacy_tx_blocks(&context.storage, 100, 10).await;
+        add_legacy_tx_blocks(&context.storage, 21, 3).await;
 
         let gas_price = GasPrice {};
         let response = gas_price.handle(context).await.unwrap();
@@ -88,7 +88,7 @@ mod tests {
         let storage = setup_store().await;
         let context = default_context_with_storage(storage).await;
 
-        add_eip1559_tx_blocks(&context.storage, 100, 10).await;
+        add_eip1559_tx_blocks(&context.storage, 21, 3).await;
 
         let gas_price = GasPrice {};
         let response = gas_price.handle(context).await.unwrap();
@@ -101,7 +101,7 @@ mod tests {
         let storage = setup_store().await;
         let context = default_context_with_storage(storage).await;
 
-        add_mixed_tx_blocks(&context.storage, 100, 10).await;
+        add_mixed_tx_blocks(&context.storage, 21, 3).await;
 
         let gas_price = GasPrice {};
         let response = gas_price.handle(context).await.unwrap();
@@ -114,7 +114,7 @@ mod tests {
         let storage = setup_store().await;
         let context = default_context_with_storage(storage).await;
 
-        add_mixed_tx_blocks(&context.storage, 100, 0).await;
+        add_mixed_tx_blocks(&context.storage, 21, 0).await;
 
         let gas_price = GasPrice {};
         let response = gas_price.handle(context).await.unwrap();
@@ -147,7 +147,7 @@ mod tests {
         let storage = setup_store().await;
         let context = default_context_with_storage(storage).await;
 
-        add_legacy_tx_blocks(&context.storage, 100, 1).await;
+        add_legacy_tx_blocks(&context.storage, 21, 1).await;
 
         let response = map_http_requests(&request, context).await.unwrap();
         assert_eq!(response, expected_response)

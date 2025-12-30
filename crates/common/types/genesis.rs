@@ -202,7 +202,6 @@ fn default_bpo2_schedule() -> ForkBlobSchedule {
     Debug,
     Serialize,
     Deserialize,
-    Default,
     PartialEq,
     RSerialize,
     RDeserialize,
@@ -212,6 +211,10 @@ fn default_bpo2_schedule() -> ForkBlobSchedule {
 pub struct ChainConfig {
     /// Current chain identifier
     pub chain_id: u64,
+
+    /// Maximum number of transactions per block.
+    #[serde(default = "default_max_txs_per_block")]
+    pub max_txs_per_block: u64,
 
     /// Block numbers for the block where each fork was activated
     /// (None = no fork, 0 = fork is already active)
@@ -266,6 +269,52 @@ pub struct ChainConfig {
     pub enable_verkle_at_genesis: bool,
 }
 
+const DEFAULT_MAX_TXS_PER_BLOCK: u64 = 300;
+
+fn default_max_txs_per_block() -> u64 {
+    DEFAULT_MAX_TXS_PER_BLOCK
+}
+
+impl Default for ChainConfig {
+    fn default() -> Self {
+        Self {
+            chain_id: 0,
+            max_txs_per_block: default_max_txs_per_block(),
+            homestead_block: None,
+            dao_fork_block: None,
+            dao_fork_support: false,
+            eip150_block: None,
+            eip155_block: None,
+            eip158_block: None,
+            byzantium_block: None,
+            constantinople_block: None,
+            petersburg_block: None,
+            istanbul_block: None,
+            muir_glacier_block: None,
+            berlin_block: None,
+            london_block: None,
+            arrow_glacier_block: None,
+            gray_glacier_block: None,
+            merge_netsplit_block: None,
+            shanghai_time: None,
+            cancun_time: None,
+            prague_time: None,
+            verkle_time: None,
+            osaka_time: None,
+            bpo1_time: None,
+            bpo2_time: None,
+            bpo3_time: None,
+            bpo4_time: None,
+            bpo5_time: None,
+            terminal_total_difficulty: None,
+            terminal_total_difficulty_passed: false,
+            blob_schedule: BlobSchedule::default(),
+            deposit_contract_address: Address::zero(),
+            enable_verkle_at_genesis: false,
+        }
+    }
+}
+
 lazy_static::lazy_static! {
     pub static ref NETWORK_NAMES: HashMap<u64, &'static str> = {
         HashMap::from([
@@ -273,7 +322,7 @@ lazy_static::lazy_static! {
             (11155111, "sepolia"),
             (17000, "holesky"),
             (560048, "hoodi"),
-            (9, "L1 local devnet"),
+            (4062024, "L1 local devnet"),
             (65536999, "L2 local devnet"),
         ])
     };
@@ -722,6 +771,12 @@ mod tests {
     use crate::types::INITIAL_BASE_FEE;
 
     use super::*;
+
+    #[test]
+    fn config_max_txs_default() {
+        let config = ChainConfig::default();
+        assert_eq!(config.max_txs_per_block, 300);
+    }
 
     #[test]
     fn deserialize_genesis_file() {

@@ -107,7 +107,7 @@ pub const ECRECOVER: Precompile = Precompile {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x01,
     ]),
-    name: "ECREC",
+    name: "SLHREC",
     active_since_fork: Paris,
 };
 
@@ -385,142 +385,61 @@ pub(crate) fn fill_with_zeros(calldata: &Bytes, target_len: usize) -> Bytes {
     padded_calldata.into()
 }
 
-#[cfg(all(
-    not(feature = "sp1"),
-    not(feature = "risc0"),
-    not(feature = "zisk"),
-    feature = "secp256k1"
-))]
-pub fn ecrecover(calldata: &Bytes, gas_remaining: &mut u64, _fork: Fork) -> Result<Bytes, VMError> {
-    use crate::gas_cost::ECRECOVER_COST;
-
-    increase_precompile_consumed_gas(ECRECOVER_COST, gas_remaining)?;
-
-    const INPUT_LEN: usize = 128;
-    const WORD: usize = 32;
-
-    let input = fill_with_zeros(calldata, INPUT_LEN);
-
-    // len(raw_hash) == 32, len(raw_v) == 32, len(raw_sig) == 64
-    let (raw_hash, tail) = input.split_at(WORD);
-    let (raw_v, raw_sig) = tail.split_at(WORD);
-
-    // EVM expects v ∈ {27, 28}. Anything else is invalid → empty return.
-    let recovery_id_byte = match u8::try_from(u256_from_big_endian(raw_v)) {
-        Ok(27) => 0_i32,
-        Ok(28) => 1_i32,
-        _ => return Ok(Bytes::new()),
-    };
-
-    // Recovery id from the adjusted byte.
-    let Ok(recovery_id) = secp256k1::ecdsa::RecoveryId::try_from(recovery_id_byte) else {
-        return Ok(Bytes::new());
-    };
-
-    let Ok(recoverable_signature) =
-        secp256k1::ecdsa::RecoverableSignature::from_compact(raw_sig, recovery_id)
-    else {
-        return Ok(Bytes::new());
-    };
-
-    let message = secp256k1::Message::from_digest(
-        raw_hash
-            .try_into()
-            .map_err(|_err| InternalError::msg("Invalid message length for ecrecover"))?,
-    );
-
-    let Ok(public_key) = recoverable_signature.recover(&message) else {
-        return Ok(Bytes::new());
-    };
-
-    // We need to take the 64 bytes from the public key (discarding the first pos of the slice)
-    let public_key_hash =
-        ethrex_crypto::keccak::keccak_hash(&public_key.serialize_uncompressed()[1..]);
-
-    // Address is the last 20 bytes of the hash.
-    let recovered_address_bytes = &public_key_hash[12..];
-
-    let mut out = [0u8; 32];
-
-    out[12..32].copy_from_slice(recovered_address_bytes);
-
-    Ok(Bytes::copy_from_slice(&out))
-}
-
-/// ## ECRECOVER precompile.
-/// Elliptic curve digital signature algorithm (ECDSA) public key recovery function.
+/// ## SLHRECOVER precompile.
+/// Stateless hash-based signature (SLH-DSA) public key recovery function.
 ///
-/// Input is 128 bytes (padded with zeros if shorter):
-///   [0..32)  : keccak-256 hash (message digest)
-///   [32..64) : v (27 or 28)
-///   [64..128): r||s (64 bytes)
+/// Input format (ABI-style):
+///   [0..32)  : message hash (32 bytes)
+///   [32..64) : offset (must be 96)
+///   [64..96) : siglen (must be 49920)
+///   [96..]   : signature bytes (sig || pubkey)
 ///
-/// Returns the recovered address.
-#[cfg(any(
-    feature = "sp1",
-    feature = "risc0",
-    feature = "zisk",
-    not(feature = "secp256k1"),
-))]
+/// Returns the recovered address padded to 32 bytes.
 pub fn ecrecover(calldata: &Bytes, gas_remaining: &mut u64, _fork: Fork) -> Result<Bytes, VMError> {
-    use ethrex_common::utils::keccak;
-    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    use crate::gas_cost::SLHRECOVER_COST;
+    use ethrex_crypto::slh_dsa::{SlhSignature, SIG_WITH_PUBKEY_LEN, slh_pubkey_to_address, slh_recover};
 
-    use crate::gas_cost::ECRECOVER_COST;
+    increase_precompile_consumed_gas(SLHRECOVER_COST, gas_remaining)?;
 
-    increase_precompile_consumed_gas(ECRECOVER_COST, gas_remaining)?;
-
-    const INPUT_LEN: usize = 128;
     const WORD: usize = 32;
+    const HEADER_LEN: usize = 96;
 
-    let input = fill_with_zeros(calldata, INPUT_LEN);
-
-    let (raw_hash, tail) = input.split_at(WORD);
-    let (raw_v, raw_sig) = tail.split_at(WORD);
-
-    // EVM expects v ∈ {27, 28}. Anything else is invalid → empty return.
-    let mut recid_byte = match u8::try_from(u256_from_big_endian(raw_v)) {
-        Ok(27) => 0,
-        Ok(28) => 1,
-        _ => return Ok(Bytes::new()),
-    };
-
-    // Parse signature (r||s). If malformed → empty return.
-    let Ok(mut sig) = Signature::from_slice(raw_sig) else {
+    if calldata.len() < HEADER_LEN {
         return Ok(Bytes::new());
-    };
-
-    // k256 enforces canonical low-S for recovery.
-    // If S is high, normalize s := n - s and flip the recovery parity bit.
-    if let Some(low_s) = sig.normalize_s() {
-        sig = low_s;
-        recid_byte ^= 1;
     }
 
-    // Recovery id from the adjusted byte.
-    let Some(recid) = RecoveryId::from_byte(recid_byte) else {
+    let raw_hash = &calldata[..WORD];
+    let raw_offset = &calldata[WORD..(2 * WORD)];
+    let raw_siglen = &calldata[(2 * WORD)..HEADER_LEN];
+
+    let offset = u256_from_big_endian(raw_offset);
+    if offset != U256::from(HEADER_LEN) {
         return Ok(Bytes::new());
-    };
-
-    // Recover the verifying key from the prehash (32-byte digest).
-    let Ok(vk) = VerifyingKey::recover_from_prehash(raw_hash, &sig, recid) else {
+    }
+    let siglen = u256_from_big_endian(raw_siglen);
+    if siglen != U256::from(SIG_WITH_PUBKEY_LEN) {
         return Ok(Bytes::new());
+    }
+
+    let siglen_usize = SIG_WITH_PUBKEY_LEN;
+    let end = HEADER_LEN.checked_add(siglen_usize).ok_or(InternalError::Overflow)?;
+    if calldata.len() < end {
+        return Ok(Bytes::new());
+    }
+    let sig_bytes = &calldata[HEADER_LEN..end];
+
+    let sig = match SlhSignature::from_bytes(sig_bytes) {
+        Ok(sig) => sig,
+        Err(_) => return Ok(Bytes::new()),
     };
+    let pubkey = match slh_recover(raw_hash, &sig) {
+        Ok(pk) => pk,
+        Err(_) => return Ok(Bytes::new()),
+    };
+    let address = slh_pubkey_to_address(&pubkey);
 
-    // SEC1 uncompressed: 0x04 || X(32) || Y(32). We need X||Y (64 bytes).
-    let uncompressed = vk.to_encoded_point(false);
-    let mut uncompressed = uncompressed.to_bytes();
-    #[allow(clippy::indexing_slicing)]
-    let xy = &mut uncompressed[1..65];
-
-    // keccak256(X||Y).
-    let xy = keccak(xy);
-
-    // Address is the last 20 bytes of the hash.
     let mut out = [0u8; 32];
-    #[allow(clippy::indexing_slicing)]
-    out[12..32].copy_from_slice(&xy[12..32]);
-
+    out[12..32].copy_from_slice(address.as_bytes());
     Ok(Bytes::copy_from_slice(&out))
 }
 
@@ -2070,6 +1989,10 @@ fn parse_scalar(scalar_bytes: &[u8]) -> Result<Scalar, VMError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gas_cost::SLHRECOVER_COST;
+    use ethrex_crypto::slh_dsa::{
+        SIG_WITH_PUBKEY_LEN, generate_slh_key, slh_pubkey_to_address, slh_sign, slh_verify,
+    };
 
     fn test_ec_pairing(calldata: &str, expected_output: &str, mut gas: u64) {
         let calldata = Bytes::from(hex::decode(calldata).unwrap());
@@ -2215,5 +2138,67 @@ mod tests {
             ecpairing(&calldata, &mut gas_remaining, Fork::Cancun),
             Err(PrecompileError::CoordinateExceedsFieldModulus.into())
         );
+    }
+
+    fn build_slhrecover_input(hash: [u8; 32], sig: &[u8], offset: u64, siglen: u64) -> Bytes {
+        let mut out = Vec::with_capacity(96 + sig.len());
+        out.extend_from_slice(&hash);
+        let word = U256::from(offset).to_big_endian();
+        out.extend_from_slice(&word);
+        let word = U256::from(siglen).to_big_endian();
+        out.extend_from_slice(&word);
+        out.extend_from_slice(sig);
+        Bytes::from(out)
+    }
+
+    #[test]
+    fn test_slhrecover_valid() {
+        let (sk, pk) = generate_slh_key();
+        let hash = [0x42u8; 32];
+        let sig = slh_sign(&hash, &sk).expect("signing should succeed");
+        let calldata =
+            build_slhrecover_input(hash, sig.as_bytes(), 96, SIG_WITH_PUBKEY_LEN as u64);
+        assert!(slh_verify(&hash, &sig));
+        assert_eq!(
+            u256_from_big_endian(&calldata[32..64]),
+            U256::from(96u64)
+        );
+        assert_eq!(
+            u256_from_big_endian(&calldata[64..96]),
+            U256::from(SIG_WITH_PUBKEY_LEN as u64)
+        );
+
+        let mut gas = SLHRECOVER_COST;
+        let out = ecrecover(&calldata, &mut gas, Fork::Paris).unwrap();
+        assert_eq!(gas, 0);
+
+        let address = slh_pubkey_to_address(&pk);
+        let mut expected = [0u8; 32];
+        expected[12..].copy_from_slice(address.as_bytes());
+        assert_eq!(out, Bytes::copy_from_slice(&expected));
+    }
+
+    #[test]
+    fn test_slhrecover_invalid_siglen() {
+        let hash = [0u8; 32];
+        let sig = vec![0u8; SIG_WITH_PUBKEY_LEN];
+        let calldata = build_slhrecover_input(hash, &sig, 96, (SIG_WITH_PUBKEY_LEN - 1) as u64);
+
+        let mut gas = SLHRECOVER_COST;
+        let out = ecrecover(&calldata, &mut gas, Fork::Paris).unwrap();
+        assert_eq!(gas, 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_slhrecover_invalid_offset() {
+        let hash = [0u8; 32];
+        let sig = vec![0u8; SIG_WITH_PUBKEY_LEN];
+        let calldata = build_slhrecover_input(hash, &sig, 0, SIG_WITH_PUBKEY_LEN as u64);
+
+        let mut gas = SLHRECOVER_COST;
+        let out = ecrecover(&calldata, &mut gas, Fork::Paris).unwrap();
+        assert_eq!(gas, 0);
+        assert!(out.is_empty());
     }
 }

@@ -10,7 +10,6 @@ use ethrex_common::{
         AuthorizationList, EIP1559Transaction, EIP7702Transaction, GenericTransaction, TxKind,
     },
 };
-use ethrex_l2_common::utils::get_address_from_secret_key;
 use ethrex_rpc::types::transaction::SendRawTransactionRequest;
 use serde::Deserialize;
 use serde_json::Value;
@@ -121,10 +120,7 @@ impl RpcHandler for SponsoredTx {
                 ));
             }
         }
-        let sponsor_address = get_address_from_secret_key(&context.sponsor_pk.secret_bytes())
-            .map_err(|_| {
-                RpcErr::InvalidEthrexL2Message("Ethrex L2 Rpc method not enabled".to_string())
-            })?;
+        let sponsor_address = context.sponsor_key.address();
         let latest_block_number = context
             .l1_ctx
             .storage
@@ -230,7 +226,7 @@ impl RpcHandler for SponsoredTx {
             ));
         }
 
-        let signer = LocalSigner::new(context.sponsor_pk).into();
+        let signer = LocalSigner::new(context.sponsor_key.clone()).into();
 
         match tx {
             SendRawTransactionRequest::EIP7702(ref mut tx) => {

@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use ethereum_types::{Address, Signature};
+use ethereum_types::Address;
+use ethrex_crypto::slh_dsa::slh_sign;
+use ethrex_l2_common::account_key::AccountPrivateKey;
 use ethrex_common::types::FeeTokenTransaction;
 use ethrex_common::utils::keccak;
 use ethrex_common::{
@@ -9,10 +11,10 @@ use ethrex_common::{
         LegacyTransaction, Transaction, TxType,
     },
 };
-use ethrex_rlp::encode::PayloadRLPEncode;
+use ethrex_rlp::{encode::PayloadRLPEncode, structs::Encoder};
 use reqwest::{Client, StatusCode, Url};
-use rustc_hex::FromHexError;
-use secp256k1::{Message, PublicKey, SECP256K1, SecretKey};
+use hex::FromHexError;
+use secp256k1::{Message, PublicKey, SECP256K1};
 use serde::Serialize;
 use url::ParseError;
 
@@ -35,7 +37,7 @@ pub struct SignerHealth {
 }
 
 impl Signer {
-    pub async fn sign(&self, data: Bytes) -> Result<Signature, SignerError> {
+    pub async fn sign(&self, data: Bytes) -> Result<Bytes, SignerError> {
         match self {
             Self::Local(signer) => Ok(signer.sign(data)),
             Self::Remote(signer) => signer.sign(data).await,
@@ -81,30 +83,40 @@ impl From<RemoteSigner> for Signer {
 
 #[derive(Clone, Debug)]
 pub struct LocalSigner {
-    pub private_key: SecretKey,
+    pub private_key: AccountPrivateKey,
     pub address: Address,
 }
 
 impl LocalSigner {
-    pub fn new(private_key: SecretKey) -> Self {
-        let address = Address::from(keccak(
-            &private_key.public_key(SECP256K1).serialize_uncompressed()[1..],
-        ));
-        Self {
-            private_key,
-            address,
-        }
+    pub fn new<K>(private_key: K) -> Self
+    where
+        K: Into<AccountPrivateKey>,
+    {
+        let private_key = private_key.into();
+        let address = private_key.address();
+        Self { private_key, address }
     }
 
-    pub fn sign(&self, data: Bytes) -> Signature {
+    pub fn sign(&self, data: Bytes) -> Bytes {
         let hash = keccak(data);
+        if let Some(slh_key) = self.private_key.slh_private_key() {
+            let sig = match slh_sign(&hash.0, slh_key) {
+                Ok(sig) => sig,
+                Err(_) => return Bytes::new(),
+            };
+            return Bytes::from(sig.as_bytes().to_vec());
+        }
+
+        let Some(secp_key) = self.private_key.legacy_secp_key() else {
+            return Bytes::new();
+        };
         let msg = Message::from_digest(hash.0);
         let (recovery_id, signature) = SECP256K1
-            .sign_ecdsa_recoverable(&msg, &self.private_key)
+            .sign_ecdsa_recoverable(&msg, secp_key)
             .serialize_compact();
 
-        Signature::from_slice(
-            &[
+        Bytes::from(
+            [
                 signature.as_slice(),
                 &[Into::<i32>::into(recovery_id) as u8],
             ]
@@ -130,7 +142,7 @@ impl RemoteSigner {
         }
     }
 
-    pub async fn sign(&self, data: Bytes) -> Result<Signature, SignerError> {
+    pub async fn sign(&self, data: Bytes) -> Result<Bytes, SignerError> {
         let url = self
             .url
             .join("api/v1/eth1/sign/")?
@@ -146,11 +158,12 @@ impl RemoteSigner {
             .await?;
 
         match response.status() {
-            StatusCode::OK => response
-                .text()
-                .await?
-                .parse::<Signature>()
-                .map_err(SignerError::FromHexError),
+            StatusCode::OK => {
+                let text = response.text().await?;
+                let text = text.trim_start_matches("0x");
+                let bytes = hex::decode(text).map_err(SignerError::FromHexError)?;
+                Ok(Bytes::from(bytes))
+            }
             StatusCode::NOT_FOUND => Err(SignerError::Web3SignerError(
                 "Private key not found in web3signer server".to_string(),
             )),
@@ -202,14 +215,6 @@ pub enum SignerError {
     Web3SignerError(String),
 }
 
-fn parse_signature(signature: Signature) -> (U256, U256, bool) {
-    let r = U256::from_big_endian(&signature[..32]);
-    let s = U256::from_big_endian(&signature[32..64]);
-    let y_parity = signature[64] != 0 && signature[64] != 27;
-
-    (r, s, y_parity)
-}
-
 pub trait Signable {
     fn sign(
         &self,
@@ -247,11 +252,21 @@ impl Signable for Transaction {
 
 impl Signable for LegacyTransaction {
     async fn sign_inplace(&mut self, signer: &Signer) -> Result<(), SignerError> {
-        let signature = signer.sign(self.encode_payload_to_vec().into()).await?;
-
-        let recovery_id = U256::from(signature[64]);
-        self.v = recovery_id + 27;
-        (self.r, self.s, _) = parse_signature(signature);
+        let chain_id = self.v.as_u64();
+        let mut payload = Vec::new();
+        Encoder::new(&mut payload)
+            .encode_field(&self.nonce)
+            .encode_field(&self.gas_price)
+            .encode_field(&self.gas)
+            .encode_field(&self.to)
+            .encode_field(&self.value)
+            .encode_field(&self.data)
+            .encode_field(&chain_id)
+            .encode_field(&0u8)
+            .encode_field(&0u8)
+            .finish();
+        let signature = signer.sign(Bytes::from(payload)).await?;
+        self.sig = signature;
 
         Ok(())
     }
@@ -263,7 +278,8 @@ impl Signable for EIP1559Transaction {
         payload.append(self.encode_payload_to_vec().as_mut());
 
         let signature = signer.sign(payload.into()).await?;
-        (self.signature_r, self.signature_s, self.signature_y_parity) = parse_signature(signature);
+        self.sig = signature;
+        self.v = U256::from(self.chain_id);
 
         Ok(())
     }
@@ -275,7 +291,8 @@ impl Signable for EIP2930Transaction {
         payload.append(self.encode_payload_to_vec().as_mut());
 
         let signature = signer.sign(payload.into()).await?;
-        (self.signature_r, self.signature_s, self.signature_y_parity) = parse_signature(signature);
+        self.sig = signature;
+        self.v = U256::from(self.chain_id);
 
         Ok(())
     }
@@ -287,7 +304,8 @@ impl Signable for EIP4844Transaction {
         payload.append(self.encode_payload_to_vec().as_mut());
 
         let signature = signer.sign(payload.into()).await?;
-        (self.signature_r, self.signature_s, self.signature_y_parity) = parse_signature(signature);
+        self.sig = signature;
+        self.v = U256::from(self.chain_id);
 
         Ok(())
     }
@@ -299,7 +317,8 @@ impl Signable for EIP7702Transaction {
         payload.append(self.encode_payload_to_vec().as_mut());
 
         let signature = signer.sign(payload.into()).await?;
-        (self.signature_r, self.signature_s, self.signature_y_parity) = parse_signature(signature);
+        self.sig = signature;
+        self.v = U256::from(self.chain_id);
 
         Ok(())
     }
@@ -311,8 +330,32 @@ impl Signable for FeeTokenTransaction {
         payload.append(self.encode_payload_to_vec().as_mut());
 
         let signature = signer.sign(payload.into()).await?;
-        (self.signature_r, self.signature_s, self.signature_y_parity) = parse_signature(signature);
+        self.sig = signature;
+        self.v = U256::from(self.chain_id);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethrex_crypto::slh_dsa::{SlhSignature, generate_slh_key, slh_verify};
+
+    #[test]
+    fn sign_message_and_verify() {
+        let (sk, _) = generate_slh_key();
+        let signer = LocalSigner::new(sk);
+        let data = Bytes::from_static(b"test-message");
+        let sig_bytes = signer.sign(data.clone());
+        let sig = match SlhSignature::from_bytes(&sig_bytes) {
+            Ok(value) => value,
+            Err(err) => {
+                assert!(false, "signature bytes should be valid: {err}");
+                return;
+            }
+        };
+        let hash = keccak(data);
+        assert!(slh_verify(&hash.0, &sig));
     }
 }

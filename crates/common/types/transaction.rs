@@ -2,17 +2,42 @@ use std::{cmp::min, fmt::Display};
 
 use crate::{errors::EcdsaError, utils::keccak};
 use bytes::Bytes;
-use ethereum_types::{Address, H256, Signature, U256};
-use hex_literal::hex;
+use ethereum_types::{Address, H256, U256};
+use ethrex_crypto::slh_dsa::{SlhSignature, slh_pubkey_to_address, slh_recover};
 pub use mempool::MempoolTransaction;
 use rkyv::{Archive, Deserialize as RDeserialize, Serialize as RSerialize};
 use serde::{Serialize, ser::SerializeStruct};
 pub use serde_impl::{
     AccessListEntry, AuthorizationTupleEntry, GenericTransaction, GenericTransactionError,
 };
+#[cfg(feature = "secp256k1")]
+use secp256k1::{
+    Message as SecpMessage,
+    ecdsa::{RecoverableSignature, RecoveryId},
+};
 
-/// The serialized length of a default eip1559 transaction
-pub const EIP1559_DEFAULT_SERIALIZED_LENGTH: usize = 15;
+/// The serialized length of a default eip1559 transaction with an SLH-DSA signature.
+pub const EIP1559_DEFAULT_SERIALIZED_LENGTH: usize =
+    ethrex_crypto::slh_dsa::SIG_WITH_PUBKEY_LEN + 20;
+
+#[cfg(feature = "secp256k1")]
+pub fn recover_address(signature: ethereum_types::Signature, hash: H256) -> Result<Address, EcdsaError> {
+    let msg = SecpMessage::from_digest_slice(hash.as_bytes())?;
+    let recovery_id = RecoveryId::try_from(signature[64] as i32)?;
+    let sig = RecoverableSignature::from_compact(&signature[0..64], recovery_id)?;
+    let recovered = secp256k1::SECP256K1.recover_ecdsa(&msg, &sig)?;
+    let uncompressed = recovered.serialize_uncompressed();
+    let hash = ethrex_crypto::keccak::keccak_hash(&uncompressed[1..]);
+    Ok(Address::from_slice(&hash[12..]))
+}
+
+#[cfg(not(feature = "secp256k1"))]
+pub fn recover_address(
+    _signature: ethereum_types::Signature,
+    _hash: H256,
+) -> Result<Address, EcdsaError> {
+    Err(k256::ecdsa::Error::new().into())
+}
 
 use ethrex_rlp::{
     constants::RLP_NULL,
@@ -190,10 +215,8 @@ pub struct LegacyTransaction {
     pub data: Bytes,
     #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
     pub v: U256,
-    #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
-    pub r: U256,
-    #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
-    pub s: U256,
+    #[rkyv(with=crate::rkyv_utils::BytesWrapper)]
+    pub sig: Bytes,
     #[rkyv(with=rkyv::with::Skip)]
     pub inner_hash: OnceCell<H256>,
 }
@@ -212,11 +235,10 @@ pub struct EIP2930Transaction {
     pub data: Bytes,
     #[rkyv(with=rkyv::with::Map<crate::rkyv_utils::AccessListItemWrapper>)]
     pub access_list: AccessList,
-    pub signature_y_parity: bool,
     #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
-    pub signature_r: U256,
-    #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
-    pub signature_s: U256,
+    pub v: U256,
+    #[rkyv(with=crate::rkyv_utils::BytesWrapper)]
+    pub sig: Bytes,
     #[rkyv(with=rkyv::with::Skip)]
     pub inner_hash: OnceCell<H256>,
 }
@@ -235,11 +257,10 @@ pub struct EIP1559Transaction {
     pub data: Bytes,
     #[rkyv(with=rkyv::with::Map<crate::rkyv_utils::AccessListItemWrapper>)]
     pub access_list: AccessList,
-    pub signature_y_parity: bool,
     #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
-    pub signature_r: U256,
-    #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
-    pub signature_s: U256,
+    pub v: U256,
+    #[rkyv(with=crate::rkyv_utils::BytesWrapper)]
+    pub sig: Bytes,
     #[rkyv(with=rkyv::with::Skip)]
     pub inner_hash: OnceCell<H256>,
 }
@@ -263,11 +284,10 @@ pub struct EIP4844Transaction {
     pub max_fee_per_blob_gas: U256,
     #[rkyv(with=rkyv::with::Map<crate::rkyv_utils::H256Wrapper>)]
     pub blob_versioned_hashes: Vec<H256>,
-    pub signature_y_parity: bool,
     #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
-    pub signature_r: U256,
-    #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
-    pub signature_s: U256,
+    pub v: U256,
+    #[rkyv(with=crate::rkyv_utils::BytesWrapper)]
+    pub sig: Bytes,
     #[rkyv(with=rkyv::with::Skip)]
     pub inner_hash: OnceCell<H256>,
 }
@@ -288,11 +308,10 @@ pub struct EIP7702Transaction {
     #[rkyv(with=rkyv::with::Map<crate::rkyv_utils::AccessListItemWrapper>)]
     pub access_list: AccessList,
     pub authorization_list: AuthorizationList,
-    pub signature_y_parity: bool,
     #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
-    pub signature_r: U256,
-    #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
-    pub signature_s: U256,
+    pub v: U256,
+    #[rkyv(with=crate::rkyv_utils::BytesWrapper)]
+    pub sig: Bytes,
     #[rkyv(with=rkyv::with::Skip)]
     pub inner_hash: OnceCell<H256>,
 }
@@ -515,9 +534,8 @@ impl RLPEncode for LegacyTransaction {
             .encode_field(&self.to)
             .encode_field(&self.value)
             .encode_field(&self.data)
+            .encode_field(&self.sig)
             .encode_field(&self.v)
-            .encode_field(&self.r)
-            .encode_field(&self.s)
             .finish();
     }
 }
@@ -533,9 +551,8 @@ impl RLPEncode for EIP2930Transaction {
             .encode_field(&self.value)
             .encode_field(&self.data)
             .encode_field(&self.access_list)
-            .encode_field(&self.signature_y_parity)
-            .encode_field(&self.signature_r)
-            .encode_field(&self.signature_s)
+            .encode_field(&self.sig)
+            .encode_field(&self.v)
             .finish()
     }
 }
@@ -552,9 +569,8 @@ impl RLPEncode for EIP1559Transaction {
             .encode_field(&self.value)
             .encode_field(&self.data)
             .encode_field(&self.access_list)
-            .encode_field(&self.signature_y_parity)
-            .encode_field(&self.signature_r)
-            .encode_field(&self.signature_s)
+            .encode_field(&self.sig)
+            .encode_field(&self.v)
             .finish()
     }
 }
@@ -573,9 +589,8 @@ impl RLPEncode for EIP4844Transaction {
             .encode_field(&self.access_list)
             .encode_field(&self.max_fee_per_blob_gas)
             .encode_field(&self.blob_versioned_hashes)
-            .encode_field(&self.signature_y_parity)
-            .encode_field(&self.signature_r)
-            .encode_field(&self.signature_s)
+            .encode_field(&self.sig)
+            .encode_field(&self.v)
             .finish()
     }
 }
@@ -617,9 +632,8 @@ impl RLPEncode for EIP7702Transaction {
             .encode_field(&self.data)
             .encode_field(&self.access_list)
             .encode_field(&self.authorization_list)
-            .encode_field(&self.signature_y_parity)
-            .encode_field(&self.signature_r)
-            .encode_field(&self.signature_s)
+            .encode_field(&self.sig)
+            .encode_field(&self.v)
             .finish()
     }
 }
@@ -654,9 +668,8 @@ impl RLPEncode for FeeTokenTransaction {
             .encode_field(&self.data)
             .encode_field(&self.access_list)
             .encode_field(&self.fee_token)
-            .encode_field(&self.signature_y_parity)
-            .encode_field(&self.signature_r)
-            .encode_field(&self.signature_s)
+            .encode_field(&self.sig)
+            .encode_field(&self.v)
             .finish()
     }
 }
@@ -797,9 +810,8 @@ impl RLPDecode for LegacyTransaction {
         let (to, decoder) = decoder.decode_field("to")?;
         let (value, decoder) = decoder.decode_field("value")?;
         let (data, decoder) = decoder.decode_field("data")?;
+        let (sig, decoder) = decoder.decode_field("sig")?;
         let (v, decoder) = decoder.decode_field("v")?;
-        let (r, decoder) = decoder.decode_field("r")?;
-        let (s, decoder) = decoder.decode_field("s")?;
         let inner_hash = OnceCell::new();
 
         let tx = LegacyTransaction {
@@ -810,8 +822,7 @@ impl RLPDecode for LegacyTransaction {
             value,
             data,
             v,
-            r,
-            s,
+            sig,
             inner_hash,
         };
         Ok((tx, decoder.finish()?))
@@ -829,9 +840,8 @@ impl RLPDecode for EIP2930Transaction {
         let (value, decoder) = decoder.decode_field("value")?;
         let (data, decoder) = decoder.decode_field("data")?;
         let (access_list, decoder) = decoder.decode_field("access_list")?;
-        let (signature_y_parity, decoder) = decoder.decode_field("signature_y_parity")?;
-        let (signature_r, decoder) = decoder.decode_field("signature_r")?;
-        let (signature_s, decoder) = decoder.decode_field("signature_s")?;
+        let (sig, decoder) = decoder.decode_field("sig")?;
+        let (v, decoder) = decoder.decode_field("v")?;
         let inner_hash = OnceCell::new();
 
         let tx = EIP2930Transaction {
@@ -843,9 +853,8 @@ impl RLPDecode for EIP2930Transaction {
             value,
             data,
             access_list,
-            signature_y_parity,
-            signature_r,
-            signature_s,
+            v,
+            sig,
             inner_hash,
         };
         Ok((tx, decoder.finish()?))
@@ -865,9 +874,8 @@ impl RLPDecode for EIP1559Transaction {
         let (value, decoder) = decoder.decode_field("value")?;
         let (data, decoder) = decoder.decode_field("data")?;
         let (access_list, decoder) = decoder.decode_field("access_list")?;
-        let (signature_y_parity, decoder) = decoder.decode_field("signature_y_parity")?;
-        let (signature_r, decoder) = decoder.decode_field("signature_r")?;
-        let (signature_s, decoder) = decoder.decode_field("signature_s")?;
+        let (sig, decoder) = decoder.decode_field("sig")?;
+        let (v, decoder) = decoder.decode_field("v")?;
         let inner_hash = OnceCell::new();
 
         let tx = EIP1559Transaction {
@@ -880,9 +888,8 @@ impl RLPDecode for EIP1559Transaction {
             value,
             data,
             access_list,
-            signature_y_parity,
-            signature_r,
-            signature_s,
+            v,
+            sig,
             inner_hash,
         };
         Ok((tx, decoder.finish()?))
@@ -904,9 +911,8 @@ impl RLPDecode for EIP4844Transaction {
         let (access_list, decoder) = decoder.decode_field("access_list")?;
         let (max_fee_per_blob_gas, decoder) = decoder.decode_field("max_fee_per_blob_gas")?;
         let (blob_versioned_hashes, decoder) = decoder.decode_field("blob_versioned_hashes")?;
-        let (signature_y_parity, decoder) = decoder.decode_field("signature_y_parity")?;
-        let (signature_r, decoder) = decoder.decode_field("signature_r")?;
-        let (signature_s, decoder) = decoder.decode_field("signature_s")?;
+        let (sig, decoder) = decoder.decode_field("sig")?;
+        let (v, decoder) = decoder.decode_field("v")?;
         let inner_hash = OnceCell::new();
 
         let tx = EIP4844Transaction {
@@ -921,9 +927,8 @@ impl RLPDecode for EIP4844Transaction {
             access_list,
             max_fee_per_blob_gas,
             blob_versioned_hashes,
-            signature_y_parity,
-            signature_r,
-            signature_s,
+            v,
+            sig,
             inner_hash,
         };
         Ok((tx, decoder.finish()?))
@@ -944,9 +949,8 @@ impl RLPDecode for EIP7702Transaction {
         let (data, decoder) = decoder.decode_field("data")?;
         let (access_list, decoder) = decoder.decode_field("access_list")?;
         let (authorization_list, decoder) = decoder.decode_field("authorization_list")?;
-        let (signature_y_parity, decoder) = decoder.decode_field("signature_y_parity")?;
-        let (signature_r, decoder) = decoder.decode_field("signature_r")?;
-        let (signature_s, decoder) = decoder.decode_field("signature_s")?;
+        let (sig, decoder) = decoder.decode_field("sig")?;
+        let (v, decoder) = decoder.decode_field("v")?;
         let inner_hash = OnceCell::new();
 
         let tx = EIP7702Transaction {
@@ -960,9 +964,8 @@ impl RLPDecode for EIP7702Transaction {
             data,
             access_list,
             authorization_list,
-            signature_y_parity,
-            signature_r,
-            signature_s,
+            v,
+            sig,
             inner_hash,
         };
         Ok((tx, decoder.finish()?))
@@ -1016,9 +1019,8 @@ impl RLPDecode for FeeTokenTransaction {
         let (data, decoder) = decoder.decode_field("data")?;
         let (access_list, decoder) = decoder.decode_field("access_list")?;
         let (fee_token, decoder) = decoder.decode_field("fee_token")?;
-        let (signature_y_parity, decoder) = decoder.decode_field("signature_y_parity")?;
-        let (signature_r, decoder) = decoder.decode_field("signature_r")?;
-        let (signature_s, decoder) = decoder.decode_field("signature_s")?;
+        let (sig, decoder) = decoder.decode_field("sig")?;
+        let (v, decoder) = decoder.decode_field("v")?;
         let inner_hash = OnceCell::new();
 
         let tx = FeeTokenTransaction {
@@ -1032,9 +1034,8 @@ impl RLPDecode for FeeTokenTransaction {
             data,
             access_list,
             fee_token,
-            signature_y_parity,
-            signature_r,
-            signature_s,
+            v,
+            sig,
             inner_hash,
         };
         Ok((tx, decoder.finish()?))
@@ -1045,21 +1046,9 @@ impl Transaction {
     pub fn sender(&self) -> Result<Address, EcdsaError> {
         match self {
             Transaction::LegacyTransaction(tx) => {
-                let signature_y_parity = match self.chain_id() {
-                    Some(chain_id) => tx.v.as_u64().saturating_sub(35 + chain_id * 2) != 0,
-                    None => tx.v.as_u64().saturating_sub(27) != 0,
-                };
                 let mut buf = vec![];
-                match self.chain_id() {
-                    None => Encoder::new(&mut buf)
-                        .encode_field(&tx.nonce)
-                        .encode_field(&tx.gas_price)
-                        .encode_field(&tx.gas)
-                        .encode_field(&tx.to)
-                        .encode_field(&tx.value)
-                        .encode_field(&tx.data)
-                        .finish(),
-                    Some(chain_id) => Encoder::new(&mut buf)
+                if let Some(chain_id) = self.chain_id() {
+                    Encoder::new(&mut buf)
                         .encode_field(&tx.nonce)
                         .encode_field(&tx.gas_price)
                         .encode_field(&tx.gas)
@@ -1069,13 +1058,21 @@ impl Transaction {
                         .encode_field(&chain_id)
                         .encode_field(&0u8)
                         .encode_field(&0u8)
-                        .finish(),
+                        .finish();
+                } else {
+                    Encoder::new(&mut buf)
+                        .encode_field(&tx.nonce)
+                        .encode_field(&tx.gas_price)
+                        .encode_field(&tx.gas)
+                        .encode_field(&tx.to)
+                        .encode_field(&tx.value)
+                        .encode_field(&tx.data)
+                        .finish();
                 }
-                let mut sig = [0u8; 65];
-                sig[..32].copy_from_slice(&tx.r.to_big_endian());
-                sig[32..64].copy_from_slice(&tx.s.to_big_endian());
-                sig[64] = signature_y_parity as u8;
-                recover_address_from_message(Signature::from_slice(&sig), &Bytes::from(buf))
+                let hash = keccak(&buf);
+                let sig = SlhSignature::from_bytes(&tx.sig)?;
+                let pubkey = slh_recover(hash.as_bytes(), &sig)?;
+                Ok(slh_pubkey_to_address(&pubkey))
             }
             Transaction::EIP2930Transaction(tx) => {
                 let mut buf = vec![self.tx_type() as u8];
@@ -1089,11 +1086,10 @@ impl Transaction {
                     .encode_field(&tx.data)
                     .encode_field(&tx.access_list)
                     .finish();
-                let mut sig = [0u8; 65];
-                sig[..32].copy_from_slice(&tx.signature_r.to_big_endian());
-                sig[32..64].copy_from_slice(&tx.signature_s.to_big_endian());
-                sig[64] = tx.signature_y_parity as u8;
-                recover_address_from_message(Signature::from_slice(&sig), &Bytes::from(buf))
+                let hash = keccak(&buf);
+                let sig = SlhSignature::from_bytes(&tx.sig)?;
+                let pubkey = slh_recover(hash.as_bytes(), &sig)?;
+                Ok(slh_pubkey_to_address(&pubkey))
             }
             Transaction::EIP1559Transaction(tx) => {
                 let mut buf = vec![self.tx_type() as u8];
@@ -1108,11 +1104,10 @@ impl Transaction {
                     .encode_field(&tx.data)
                     .encode_field(&tx.access_list)
                     .finish();
-                let mut sig = [0u8; 65];
-                sig[..32].copy_from_slice(&tx.signature_r.to_big_endian());
-                sig[32..64].copy_from_slice(&tx.signature_s.to_big_endian());
-                sig[64] = tx.signature_y_parity as u8;
-                recover_address_from_message(Signature::from_slice(&sig), &Bytes::from(buf))
+                let hash = keccak(&buf);
+                let sig = SlhSignature::from_bytes(&tx.sig)?;
+                let pubkey = slh_recover(hash.as_bytes(), &sig)?;
+                Ok(slh_pubkey_to_address(&pubkey))
             }
             Transaction::EIP4844Transaction(tx) => {
                 let mut buf = vec![self.tx_type() as u8];
@@ -1129,11 +1124,10 @@ impl Transaction {
                     .encode_field(&tx.max_fee_per_blob_gas)
                     .encode_field(&tx.blob_versioned_hashes)
                     .finish();
-                let mut sig = [0u8; 65];
-                sig[..32].copy_from_slice(&tx.signature_r.to_big_endian());
-                sig[32..64].copy_from_slice(&tx.signature_s.to_big_endian());
-                sig[64] = tx.signature_y_parity as u8;
-                recover_address_from_message(Signature::from_slice(&sig), &Bytes::from(buf))
+                let hash = keccak(&buf);
+                let sig = SlhSignature::from_bytes(&tx.sig)?;
+                let pubkey = slh_recover(hash.as_bytes(), &sig)?;
+                Ok(slh_pubkey_to_address(&pubkey))
             }
             Transaction::EIP7702Transaction(tx) => {
                 let mut buf = vec![self.tx_type() as u8];
@@ -1149,11 +1143,10 @@ impl Transaction {
                     .encode_field(&tx.access_list)
                     .encode_field(&tx.authorization_list)
                     .finish();
-                let mut sig = [0u8; 65];
-                sig[..32].copy_from_slice(&tx.signature_r.to_big_endian());
-                sig[32..64].copy_from_slice(&tx.signature_s.to_big_endian());
-                sig[64] = tx.signature_y_parity as u8;
-                recover_address_from_message(Signature::from_slice(&sig), &Bytes::from(buf))
+                let hash = keccak(&buf);
+                let sig = SlhSignature::from_bytes(&tx.sig)?;
+                let pubkey = slh_recover(hash.as_bytes(), &sig)?;
+                Ok(slh_pubkey_to_address(&pubkey))
             }
             Transaction::PrivilegedL2Transaction(tx) => Ok(tx.from),
             Transaction::FeeTokenTransaction(tx) => {
@@ -1170,11 +1163,10 @@ impl Transaction {
                     .encode_field(&tx.access_list)
                     .encode_field(&tx.fee_token)
                     .finish();
-                let mut sig = [0u8; 65];
-                sig[..32].copy_from_slice(&tx.signature_r.to_big_endian());
-                sig[32..64].copy_from_slice(&tx.signature_s.to_big_endian());
-                sig[64] = tx.signature_y_parity as u8;
-                recover_address_from_message(Signature::from_slice(&sig), &Bytes::from(buf))
+                let hash = keccak(&buf);
+                let sig = SlhSignature::from_bytes(&tx.sig)?;
+                let pubkey = slh_recover(hash.as_bytes(), &sig)?;
+                Ok(slh_pubkey_to_address(&pubkey))
             }
         }
     }
@@ -1242,7 +1234,7 @@ impl Transaction {
 
     pub fn chain_id(&self) -> Option<u64> {
         match self {
-            Transaction::LegacyTransaction(tx) => derive_legacy_chain_id(tx.v),
+            Transaction::LegacyTransaction(tx) => Some(tx.v.as_u64()),
             Transaction::EIP2930Transaction(tx) => Some(tx.chain_id),
             Transaction::EIP1559Transaction(tx) => Some(tx.chain_id),
             Transaction::EIP4844Transaction(tx) => Some(tx.chain_id),
@@ -1393,112 +1385,7 @@ impl Transaction {
     /// Returns whether the transaction is replay-protected.
     /// For more information check out [EIP-155](https://github.com/ethereum/EIPs/blob/master/EIPS/eip-155.md)
     pub fn protected(&self) -> bool {
-        match self {
-            Transaction::LegacyTransaction(tx) if tx.v.bits() <= 8 => {
-                let v = tx.v.as_u64();
-                v != 27 && v != 28 && v != 1 && v != 0
-            }
-            _ => true,
-        }
-    }
-}
-
-pub fn recover_address_from_message(
-    signature: Signature,
-    message: &Bytes,
-) -> Result<Address, EcdsaError> {
-    // Hash message
-    let payload = keccak(message);
-    recover_address(signature, payload).map_err(EcdsaError::from)
-}
-
-// Half the secp256k1 curve order (n/2), i.e. the upper bound for a valid `s` value per EIP-2.
-const SECP256K1_N_HALF: [u8; 32] =
-    hex!("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0");
-
-fn signature_has_high_s(signature_bytes: &[u8; 65]) -> bool {
-    signature_bytes[32..64] > SECP256K1_N_HALF[..]
-}
-
-#[cfg(all(
-    not(feature = "zisk"),
-    not(feature = "risc0"),
-    not(feature = "sp1"),
-    feature = "secp256k1"
-))]
-pub fn recover_address(signature: Signature, payload: H256) -> Result<Address, secp256k1::Error> {
-    // Create signature
-    let signature_bytes = signature.to_fixed_bytes();
-    // EIP-2: reject high-s signatures (s > secp256k1n/2).
-    if signature_has_high_s(&signature_bytes) {
-        return Err(secp256k1::Error::InvalidSignature);
-    }
-    let signature = secp256k1::ecdsa::RecoverableSignature::from_compact(
-        &signature_bytes[..64],
-        secp256k1::ecdsa::RecoveryId::try_from(signature_bytes[64] as i32)?,
-    )?;
-    // Recover public key
-    let public = secp256k1::SECP256K1.recover_ecdsa(
-        &secp256k1::Message::from_digest(payload.to_fixed_bytes()),
-        &signature,
-    )?;
-    // Hash public key to obtain address
-    let hash = ethrex_crypto::keccak::keccak_hash(&public.serialize_uncompressed()[1..]);
-    Ok(Address::from_slice(&hash[12..]))
-}
-
-#[cfg(any(
-    feature = "zisk",
-    feature = "risc0",
-    feature = "sp1",
-    not(feature = "secp256k1")
-))]
-pub fn recover_address(signature: Signature, payload: H256) -> Result<Address, k256::ecdsa::Error> {
-    use sha2::Digest;
-    use sha3::Keccak256;
-
-    // Create signature
-    let signature_bytes = signature.to_fixed_bytes();
-    // EIP-2: signatures must use "low-s" (s <= secp256k1n/2).
-    // Standard k256 rejects high-s signatures by default but it's best to leave this for 3 reasons:
-    // 1. Make it more explicit
-    // 2. Sometimes it can happen that the zkVM patch can have a different behavior than the original crate (shouldn't happen, but has happened). So we put this just in case.
-    // 3. Fail fast
-    if signature_has_high_s(&signature_bytes) {
-        return Err(k256::ecdsa::Error::from_source("High-s signature"));
-    }
-
-    let signature = k256::ecdsa::Signature::from_slice(&signature_bytes[..64])?;
-
-    let recovery_id_byte = signature_bytes[64];
-    let recovery_id = k256::ecdsa::RecoveryId::from_byte(recovery_id_byte).ok_or(
-        k256::ecdsa::Error::from_source("Failed to parse recovery id"),
-    )?;
-
-    // Recover public key
-    let public = k256::ecdsa::VerifyingKey::recover_from_prehash(
-        payload.as_bytes(),
-        &signature,
-        recovery_id,
-    )?;
-
-    let uncompressed = public.to_encoded_point(false);
-
-    let mut uncompressed = uncompressed.to_bytes();
-
-    let xy = &mut uncompressed[1..65];
-
-    let hash = Keccak256::digest(xy);
-
-    Ok(Address::from_slice(&hash[12..]))
-}
-
-fn derive_legacy_chain_id(v: U256) -> Option<u64> {
-    let v = v.as_u64(); //TODO: Could panic if v is bigger than Max u64
-    if v == 27 || v == 28 {
-        None
-    } else {
-        Some((v - 35) / 2)
+        true
     }
 }
 
@@ -1566,11 +1453,10 @@ pub struct FeeTokenTransaction {
     pub access_list: AccessList,
     #[rkyv(with=crate::rkyv_utils::H160Wrapper)]
     pub fee_token: Address,
-    pub signature_y_parity: bool,
     #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
-    pub signature_r: U256,
-    #[rkyv(with=crate::rkyv_utils::U256Wrapper)]
-    pub signature_s: U256,
+    pub v: U256,
+    #[rkyv(with=crate::rkyv_utils::BytesWrapper)]
+    pub sig: Bytes,
     #[rkyv(with=rkyv::with::Skip)]
     pub inner_hash: OnceCell<H256>,
 }
@@ -1850,7 +1736,7 @@ mod serde_impl {
         where
             S: serde::Serializer,
         {
-            let mut struct_serializer = serializer.serialize_struct("LegacyTransaction", 11)?;
+            let mut struct_serializer = serializer.serialize_struct("LegacyTransaction", 10)?;
             struct_serializer.serialize_field("type", &TxType::Legacy)?;
             struct_serializer.serialize_field("nonce", &format!("{:#x}", self.nonce))?;
             struct_serializer.serialize_field("to", &self.to)?;
@@ -1858,13 +1744,9 @@ mod serde_impl {
             struct_serializer.serialize_field("value", &self.value)?;
             struct_serializer.serialize_field("input", &format!("0x{:x}", self.data))?;
             struct_serializer.serialize_field("gasPrice", &format!("{:#x}", self.gas_price))?;
-            struct_serializer.serialize_field(
-                "chainId",
-                &format!("{:#x}", derive_legacy_chain_id(self.v).unwrap_or_default()),
-            )?;
-            struct_serializer.serialize_field("v", &self.v)?;
-            struct_serializer.serialize_field("r", &self.r)?;
-            struct_serializer.serialize_field("s", &self.s)?;
+            struct_serializer.serialize_field("chainId", &format!("{:#x}", self.v))?;
+            struct_serializer.serialize_field("v", &format!("{:#x}", self.v))?;
+            struct_serializer.serialize_field("sig", &format!("0x{:x}", self.sig))?;
             struct_serializer.end()
         }
     }
@@ -1874,7 +1756,7 @@ mod serde_impl {
         where
             S: serde::Serializer,
         {
-            let mut struct_serializer = serializer.serialize_struct("Eip2930Transaction", 12)?;
+            let mut struct_serializer = serializer.serialize_struct("Eip2930Transaction", 11)?;
             struct_serializer.serialize_field("type", &TxType::EIP2930)?;
             struct_serializer.serialize_field("nonce", &format!("{:#x}", self.nonce))?;
             struct_serializer.serialize_field("to", &self.to)?;
@@ -1891,12 +1773,8 @@ mod serde_impl {
                     .collect::<Vec<_>>(),
             )?;
             struct_serializer.serialize_field("chainId", &format!("{:#x}", self.chain_id))?;
-            struct_serializer
-                .serialize_field("yParity", &format!("{:#x}", self.signature_y_parity as u8))?;
-            struct_serializer
-                .serialize_field("v", &format!("{:#x}", self.signature_y_parity as u8))?; // added to match Hive tests
-            struct_serializer.serialize_field("r", &self.signature_r)?;
-            struct_serializer.serialize_field("s", &self.signature_s)?;
+            struct_serializer.serialize_field("v", &format!("{:#x}", self.v))?;
+            struct_serializer.serialize_field("sig", &format!("0x{:x}", self.sig))?;
             struct_serializer.end()
         }
     }
@@ -1906,7 +1784,7 @@ mod serde_impl {
         where
             S: serde::Serializer,
         {
-            let mut struct_serializer = serializer.serialize_struct("Eip1559Transaction", 14)?;
+            let mut struct_serializer = serializer.serialize_struct("Eip1559Transaction", 13)?;
             struct_serializer.serialize_field("type", &TxType::EIP1559)?;
             struct_serializer.serialize_field("nonce", &format!("{:#x}", self.nonce))?;
             struct_serializer.serialize_field("to", &self.to)?;
@@ -1930,12 +1808,8 @@ mod serde_impl {
                     .collect::<Vec<_>>(),
             )?;
             struct_serializer.serialize_field("chainId", &format!("{:#x}", self.chain_id))?;
-            struct_serializer
-                .serialize_field("yParity", &format!("{:#x}", self.signature_y_parity as u8))?;
-            struct_serializer
-                .serialize_field("v", &format!("{:#x}", self.signature_y_parity as u8))?; // added to match Hive tests
-            struct_serializer.serialize_field("r", &self.signature_r)?;
-            struct_serializer.serialize_field("s", &self.signature_s)?;
+            struct_serializer.serialize_field("v", &format!("{:#x}", self.v))?;
+            struct_serializer.serialize_field("sig", &format!("0x{:x}", self.sig))?;
             struct_serializer.end()
         }
     }
@@ -1975,12 +1849,8 @@ mod serde_impl {
             struct_serializer
                 .serialize_field("blobVersionedHashes", &self.blob_versioned_hashes)?;
             struct_serializer.serialize_field("chainId", &format!("{:#x}", self.chain_id))?;
-            struct_serializer
-                .serialize_field("yParity", &format!("{:#x}", self.signature_y_parity as u8))?;
-            struct_serializer
-                .serialize_field("v", &format!("{:#x}", self.signature_y_parity as u8))?; // added to match Hive tests
-            struct_serializer.serialize_field("r", &self.signature_r)?;
-            struct_serializer.serialize_field("s", &self.signature_s)?;
+            struct_serializer.serialize_field("v", &format!("{:#x}", self.v))?;
+            struct_serializer.serialize_field("sig", &format!("0x{:x}", self.sig))?;
             struct_serializer.end()
         }
     }
@@ -1990,7 +1860,7 @@ mod serde_impl {
         where
             S: serde::Serializer,
         {
-            let mut struct_serializer = serializer.serialize_struct("Eip7702Transaction", 15)?;
+            let mut struct_serializer = serializer.serialize_struct("Eip7702Transaction", 14)?;
             struct_serializer.serialize_field("type", &TxType::EIP7702)?;
             struct_serializer.serialize_field("nonce", &format!("{:#x}", self.nonce))?;
             struct_serializer.serialize_field("to", &self.to)?;
@@ -2022,12 +1892,8 @@ mod serde_impl {
                     .collect::<Vec<_>>(),
             )?;
             struct_serializer.serialize_field("chainId", &format!("{:#x}", self.chain_id))?;
-            struct_serializer
-                .serialize_field("yParity", &format!("{:#x}", self.signature_y_parity as u8))?;
-            struct_serializer
-                .serialize_field("v", &format!("{:#x}", self.signature_y_parity as u8))?; // added to match Hive tests
-            struct_serializer.serialize_field("r", &self.signature_r)?;
-            struct_serializer.serialize_field("s", &self.signature_s)?;
+            struct_serializer.serialize_field("v", &format!("{:#x}", self.v))?;
+            struct_serializer.serialize_field("sig", &format!("0x{:x}", self.sig))?;
             struct_serializer.end()
         }
     }
@@ -2071,7 +1937,7 @@ mod serde_impl {
         where
             S: serde::Serializer,
         {
-            let mut struct_serializer = serializer.serialize_struct("FeeTokenTransaction", 15)?;
+            let mut struct_serializer = serializer.serialize_struct("FeeTokenTransaction", 14)?;
             struct_serializer.serialize_field("type", &TxType::FeeToken)?;
             struct_serializer.serialize_field("nonce", &format!("{:#x}", self.nonce))?;
             struct_serializer.serialize_field("to", &self.to)?;
@@ -2096,12 +1962,8 @@ mod serde_impl {
             )?;
             struct_serializer.serialize_field("feeToken", &format!("{:#x}", self.fee_token))?;
             struct_serializer.serialize_field("chainId", &format!("{:#x}", self.chain_id))?;
-            struct_serializer
-                .serialize_field("yParity", &format!("{:#x}", self.signature_y_parity as u8))?;
-            struct_serializer
-                .serialize_field("v", &format!("{:#x}", self.signature_y_parity as u8))?;
-            struct_serializer.serialize_field("r", &self.signature_r)?;
-            struct_serializer.serialize_field("s", &self.signature_s)?;
+            struct_serializer.serialize_field("v", &format!("{:#x}", self.v))?;
+            struct_serializer.serialize_field("sig", &format!("0x{:x}", self.sig))?;
             struct_serializer.end()
         }
     }
@@ -2198,6 +2060,26 @@ mod serde_impl {
         }
     }
 
+    fn deserialize_hex_bytes_field<'de, D>(
+        map: &mut HashMap<String, serde_json::Value>,
+        key: &str,
+    ) -> Result<Bytes, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let data_str: String = serde_json::from_value(
+            map.remove(key)
+                .ok_or_else(|| D::Error::custom(format!("Missing field: {key}")))?,
+        )
+        .map_err(D::Error::custom)?;
+        let stripped = data_str
+            .strip_prefix("0x")
+            .ok_or_else(|| D::Error::custom(format!("'{key}' field must start with '0x'")))?;
+        hex::decode(stripped)
+            .map(Bytes::from)
+            .map_err(|_| D::Error::custom(format!("Invalid hex format in '{key}' field")))
+    }
+
     fn deserialize_field<'de, T, D>(
         map: &mut HashMap<String, serde_json::Value>,
         key: &str,
@@ -2228,8 +2110,7 @@ mod serde_impl {
                 value: deserialize_field::<U256, D>(&mut map, "value")?,
                 data: deserialize_input_field(&mut map).map_err(serde::de::Error::custom)?,
                 v: deserialize_field::<U256, D>(&mut map, "v")?,
-                r: deserialize_field::<U256, D>(&mut map, "r")?,
-                s: deserialize_field::<U256, D>(&mut map, "s")?,
+                sig: deserialize_hex_bytes_field::<D>(&mut map, "sig")?,
                 ..Default::default()
             })
         }
@@ -2254,14 +2135,8 @@ mod serde_impl {
                     .into_iter()
                     .map(|v| (v.address, v.storage_keys))
                     .collect::<Vec<_>>(),
-                signature_y_parity: u8::from_str_radix(
-                    deserialize_field::<String, D>(&mut map, "yParity")?.trim_start_matches("0x"),
-                    16,
-                )
-                .map_err(serde::de::Error::custom)?
-                    != 0,
-                signature_r: deserialize_field::<U256, D>(&mut map, "r")?,
-                signature_s: deserialize_field::<U256, D>(&mut map, "s")?,
+                v: deserialize_field::<U256, D>(&mut map, "v")?,
+                sig: deserialize_hex_bytes_field::<D>(&mut map, "sig")?,
                 ..Default::default()
             })
         }
@@ -2290,14 +2165,8 @@ mod serde_impl {
                     .into_iter()
                     .map(|v| (v.address, v.storage_keys))
                     .collect::<Vec<_>>(),
-                signature_y_parity: u8::from_str_radix(
-                    deserialize_field::<String, D>(&mut map, "yParity")?.trim_start_matches("0x"),
-                    16,
-                )
-                .map_err(serde::de::Error::custom)?
-                    != 0,
-                signature_r: deserialize_field::<U256, D>(&mut map, "r")?,
-                signature_s: deserialize_field::<U256, D>(&mut map, "s")?,
+                v: deserialize_field::<U256, D>(&mut map, "v")?,
+                sig: deserialize_hex_bytes_field::<D>(&mut map, "sig")?,
                 ..Default::default()
             })
         }
@@ -2332,14 +2201,8 @@ mod serde_impl {
                     &mut map,
                     "blobVersionedHashes",
                 )?,
-                signature_y_parity: u8::from_str_radix(
-                    deserialize_field::<String, D>(&mut map, "yParity")?.trim_start_matches("0x"),
-                    16,
-                )
-                .map_err(serde::de::Error::custom)?
-                    != 0,
-                signature_r: deserialize_field::<U256, D>(&mut map, "r")?,
-                signature_s: deserialize_field::<U256, D>(&mut map, "s")?,
+                v: deserialize_field::<U256, D>(&mut map, "v")?,
+                sig: deserialize_hex_bytes_field::<D>(&mut map, "sig")?,
                 ..Default::default()
             })
         }
@@ -2376,14 +2239,8 @@ mod serde_impl {
                 .into_iter()
                 .map(AuthorizationTuple::from)
                 .collect::<Vec<_>>(),
-                signature_y_parity: u8::from_str_radix(
-                    deserialize_field::<String, D>(&mut map, "yParity")?.trim_start_matches("0x"),
-                    16,
-                )
-                .map_err(serde::de::Error::custom)?
-                    != 0,
-                signature_r: deserialize_field::<U256, D>(&mut map, "r")?,
-                signature_s: deserialize_field::<U256, D>(&mut map, "s")?,
+                v: deserialize_field::<U256, D>(&mut map, "v")?,
+                sig: deserialize_hex_bytes_field::<D>(&mut map, "sig")?,
                 ..Default::default()
             })
         }
@@ -2444,14 +2301,8 @@ mod serde_impl {
                     .map(|v| (v.address, v.storage_keys))
                     .collect::<Vec<_>>(),
                 fee_token: deserialize_field::<Address, D>(&mut map, "feeToken")?,
-                signature_y_parity: u8::from_str_radix(
-                    deserialize_field::<String, D>(&mut map, "yParity")?.trim_start_matches("0x"),
-                    16,
-                )
-                .map_err(serde::de::Error::custom)?
-                    != 0,
-                signature_r: deserialize_field::<U256, D>(&mut map, "r")?,
-                signature_s: deserialize_field::<U256, D>(&mut map, "s")?,
+                v: deserialize_field::<U256, D>(&mut map, "v")?,
+                sig: deserialize_hex_bytes_field::<D>(&mut map, "sig")?,
                 ..Default::default()
             })
         }
@@ -2890,7 +2741,7 @@ mod serde_impl {
                 blob_versioned_hashes: vec![],
                 blobs: vec![],
                 wrapper_version: None,
-                chain_id: None,
+                chain_id: Some(value.v.as_u64()),
                 input: value.data,
             }
         }
@@ -3049,10 +2900,21 @@ mod tests {
     use crate::types::{
         AuthorizationTuple, BlockBody, Receipt, compute_receipts_root, compute_transactions_root,
     };
+    use ethrex_crypto::slh_dsa::{
+        SIG_WITH_PUBKEY_LEN, generate_slh_key, slh_pubkey_to_address, slh_sign,
+    };
     use ethereum_types::H160;
     use hex_literal::hex;
     use serde_impl::{AccessListEntry, GenericTransaction};
     use std::str::FromStr;
+
+    fn sign_payload(payload: &[u8]) -> (Bytes, Address) {
+        let (sk, pk) = generate_slh_key();
+        let hash = keccak(payload);
+        let sig = slh_sign(hash.as_bytes(), &sk).expect("signing should succeed");
+        let address = slh_pubkey_to_address(&pk);
+        (Bytes::from(sig.as_bytes().to_vec()), address)
+    }
 
     #[test]
     fn test_compute_transactions_root() {
@@ -3065,20 +2927,29 @@ mod tests {
             value: 0.into(),
             data: Default::default(),
             v: U256::from(0x1b),
-            r: U256::from_big_endian(&hex!(
-                "7e09e26678ed4fac08a249ebe8ed680bf9051a5e14ad223e4b2b9d26e0208f37"
-            )),
-            s: U256::from_big_endian(&hex!(
-                "5f6e3f188e3e6eab7d7d3b6568f5eac7d687b08d307d3154ccd8c87b4630509b"
-            )),
+            sig: Bytes::from(vec![0x11; SIG_WITH_PUBKEY_LEN]),
             ..Default::default()
         };
         body.transactions.push(Transaction::LegacyTransaction(tx));
-        let expected_root =
-            hex!("8151d548273f6683169524b66ca9fe338b9ce42bc3540046c828fd939ae23bcb");
         let result = compute_transactions_root(&body.transactions);
-
-        assert_eq!(result, expected_root.into());
+        let mut other_body = BlockBody::empty();
+        let other_tx = LegacyTransaction {
+            nonce: 1,
+            gas_price: U256::from(0x0b),
+            gas: 0x05f5e100,
+            to: TxKind::Call(hex!("2000000000000000000000000000000000000000").into()),
+            value: 1.into(),
+            data: Default::default(),
+            v: U256::from(0x1b),
+            sig: Bytes::from(vec![0x22; SIG_WITH_PUBKEY_LEN]),
+            ..Default::default()
+        };
+        other_body
+            .transactions
+            .push(Transaction::LegacyTransaction(other_tx));
+        let other_result = compute_transactions_root(&other_body.transactions);
+        assert_ne!(result, other_result);
+        assert_ne!(result, H256::zero());
     }
     #[test]
     fn test_compute_hash() {
@@ -3098,23 +2969,15 @@ mod tests {
                     hex!("a3d07a7d68fbd49ec2f8e6befdd86c885f86c272819f6f345f365dec35ae6707").into(),
                 ],
             )],
-            signature_y_parity: false,
-            signature_r: U256::from_dec_str(
-                "75813812796588349127366022588733264074091236448495248199152066031778895768879",
-            )
-            .unwrap(),
-            signature_s: U256::from_dec_str(
-                "25476208226281085290728123165613764315157904411823916642262684106502155457829",
-            )
-            .unwrap(),
+            v: U256::from(3503995874084926u64),
+            sig: Bytes::from(vec![0x22; SIG_WITH_PUBKEY_LEN]),
             ..Default::default()
         };
         let tx = Transaction::EIP2930Transaction(tx_eip2930);
 
-        let expected_hash =
-            hex!("a0762610d794acddd2dca15fb7c437ada3611c886f3bea675d53d8da8a6c41b2");
         let hash = tx.compute_hash();
-        assert_eq!(hash, expected_hash.into());
+        let expected_hash = crate::utils::keccak(tx.encode_canonical_to_vec());
+        assert_eq!(hash, expected_hash);
     }
 
     #[test]
@@ -3135,10 +2998,7 @@ mod tests {
 
     #[test]
     fn legacy_tx_rlp_decode() {
-        let encoded_tx = "f86d80843baa0c4082f618946177843db3138ae69679a54b95cf345ed759450d870aa87bee538000808360306ba0151ccc02146b9b11adf516e6787b59acae3e76544fdcd75e77e67c6b598ce65da064c5dd5aae2fbb535830ebbdad0234975cd7ece3562013b63ea18cc0df6c97d4";
-        let encoded_tx_bytes = hex::decode(encoded_tx).unwrap();
-        let tx = LegacyTransaction::decode(&encoded_tx_bytes).unwrap();
-        let expected_tx = LegacyTransaction {
+        let tx = LegacyTransaction {
             nonce: 0,
             gas_price: U256::from(1001000000u64),
             gas: 63000,
@@ -3147,28 +3007,18 @@ mod tests {
             )),
             value: 3000000000000000_u64.into(),
             data: Bytes::new(),
-            r: U256::from_str_radix(
-                "151ccc02146b9b11adf516e6787b59acae3e76544fdcd75e77e67c6b598ce65d",
-                16,
-            )
-            .unwrap(),
-            s: U256::from_str_radix(
-                "64c5dd5aae2fbb535830ebbdad0234975cd7ece3562013b63ea18cc0df6c97d4",
-                16,
-            )
-            .unwrap(),
             v: 6303851.into(),
+            sig: Bytes::from(vec![0x55; SIG_WITH_PUBKEY_LEN]),
             ..Default::default()
         };
-        assert_eq!(tx, expected_tx);
+        let encoded = LegacyTransaction::encode_to_vec(&tx);
+        let decoded = LegacyTransaction::decode(&encoded).unwrap();
+        assert_eq!(decoded, tx);
     }
 
     #[test]
     fn eip1559_tx_rlp_decode() {
-        let encoded_tx = "f86c8330182480114e82f618946177843db3138ae69679a54b95cf345ed759450d870aa87bee53800080c080a0151ccc02146b9b11adf516e6787b59acae3e76544fdcd75e77e67c6b598ce65da064c5dd5aae2fbb535830ebbdad0234975cd7ece3562013b63ea18cc0df6c97d4";
-        let encoded_tx_bytes = hex::decode(encoded_tx).unwrap();
-        let tx = EIP1559Transaction::decode(&encoded_tx_bytes).unwrap();
-        let expected_tx = EIP1559Transaction {
+        let tx = EIP1559Transaction {
             nonce: 0,
             max_fee_per_gas: 78,
             max_priority_fee_per_gas: 17,
@@ -3177,23 +3027,16 @@ mod tests {
             )),
             value: 3000000000000000_u64.into(),
             data: Bytes::new(),
-            signature_r: U256::from_str_radix(
-                "151ccc02146b9b11adf516e6787b59acae3e76544fdcd75e77e67c6b598ce65d",
-                16,
-            )
-            .unwrap(),
-            signature_s: U256::from_str_radix(
-                "64c5dd5aae2fbb535830ebbdad0234975cd7ece3562013b63ea18cc0df6c97d4",
-                16,
-            )
-            .unwrap(),
-            signature_y_parity: false,
             chain_id: 3151908,
+            v: 3151908.into(),
+            sig: Bytes::from(vec![0x66; SIG_WITH_PUBKEY_LEN]),
             gas_limit: 63000,
             access_list: vec![],
             ..Default::default()
         };
-        assert_eq!(tx, expected_tx);
+        let encoded = EIP1559Transaction::encode_to_vec(&tx);
+        let decoded = EIP1559Transaction::decode(&encoded).unwrap();
+        assert_eq!(decoded, tx);
     }
 
     #[test]
@@ -3364,9 +3207,8 @@ mod tests {
                     "0x0000000000000000000000000000000000000000000000000000000000000001",
                     "0x0000000000000000000000000000000000000000000000000000000000000002"
             ],
-            "yParity":"0x0",
-            "r": "0x01",
-            "s": "0x02"
+            "v":"0x01",
+            "sig": "0x0102"
         }"#;
         let deserialized_eip4844_transaction = EIP4844Transaction {
             chain_id: 0x01,
@@ -3388,9 +3230,8 @@ mod tests {
                 vec![H256::from_low_u64_be(12), H256::from_low_u64_be(8203)],
             )],
             blob_versioned_hashes: vec![H256::from_low_u64_be(1), H256::from_low_u64_be(2)],
-            signature_y_parity: false,
-            signature_r: U256::from(0x01),
-            signature_s: U256::from(0x02),
+            v: U256::from(0x01),
+            sig: Bytes::from_static(&[0x01, 0x02]),
             ..Default::default()
         };
 
@@ -3415,9 +3256,8 @@ mod tests {
                 H160::from_str("0x000a52D537c4150ec274dcE3962a0d179B7E71B3").unwrap(),
                 vec![H256::zero()],
             )],
-            signature_y_parity: true,
-            signature_r: U256::one(),
-            signature_s: U256::zero(),
+            v: U256::from(65536999u64),
+            sig: Bytes::from_static(b"sig"),
             ..Default::default()
         };
         let tx_to_serialize = Transaction::EIP1559Transaction(eip1559.clone());
@@ -3445,9 +3285,8 @@ mod tests {
             value: U256::from(100000),
             data: Bytes::from_static(b"03"),
             access_list: vec![],
-            signature_y_parity: true,
-            signature_r: U256::one(),
-            signature_s: U256::zero(),
+            v: U256::from(65536999u64),
+            sig: Bytes::from_static(b"sig"),
             authorization_list: vec![AuthorizationTuple {
                 chain_id: U256::from(65536999),
                 address: H160::from_str("0x000a52D537c4150ec274dcE3962a0d179B7E71B1").unwrap(),
@@ -3512,8 +3351,7 @@ mod tests {
             value: U256::from(1_000_000_000_000_000_000u64),
             data: Bytes::default(),
             v: U256::from(27),
-            r: U256::from(1),
-            s: U256::from(1),
+            sig: Bytes::from_static(b"sig"),
             ..Default::default()
         };
 
@@ -3525,7 +3363,7 @@ mod tests {
         assert_eq!(generic_tx.max_priority_fee_per_gas, None);
         assert_eq!(generic_tx.max_fee_per_gas, None);
         assert_eq!(generic_tx.access_list.len(), 0);
-        assert_eq!(generic_tx.chain_id, None);
+        assert_eq!(generic_tx.chain_id, Some(27));
     }
 
     #[test]
@@ -3551,9 +3389,8 @@ mod tests {
             value: U256::from(1_000_000_000_000_000_000u64),
             data: Bytes::default(),
             access_list: access_list.clone(),
-            signature_y_parity: false,
-            signature_r: U256::from(1),
-            signature_s: U256::from(1),
+            v: U256::from(1),
+            sig: Bytes::from_static(b"sig"),
             ..Default::default()
         };
 
@@ -3571,71 +3408,69 @@ mod tests {
     }
 
     #[test]
-    fn recover_address_rejects_high_s_signatures() {
-        use k256::ecdsa::SigningKey;
+    fn tx_sign_and_recover_sender() {
+        let mut tx = EIP1559Transaction {
+            chain_id: 123,
+            nonce: 1,
+            max_priority_fee_per_gas: 2,
+            max_fee_per_gas: 3,
+            gas_limit: 21000,
+            to: TxKind::Call(Address::from_low_u64_be(0x42)),
+            value: U256::from(1u64),
+            data: Bytes::new(),
+            access_list: vec![],
+            v: U256::from(123u64),
+            sig: Bytes::new(),
+            ..Default::default()
+        };
+        let mut payload = vec![TxType::EIP1559 as u8];
+        payload.append(tx.encode_payload_to_vec().as_mut());
+        let (sig, expected_sender) = sign_payload(&payload);
+        tx.sig = sig;
 
-        // 1. Setup: Create a signer and a message
-        // A random private key for testing
-        let private_key = hex!("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318");
-        let signing_key = SigningKey::from_bytes(&private_key.into()).expect("Valid private key");
+        let sender = Transaction::EIP1559Transaction(tx).sender().unwrap();
+        assert_eq!(sender, expected_sender);
+    }
 
-        // The message we want to sign
-        let msg = b"Test message for high-s signature rejection";
-        // Calculate the Keccak256 hash of the message (the payload)
-        let payload = keccak(msg);
+    #[test]
+    fn tx_json_roundtrip_with_sig() {
+        let tx = EIP2930Transaction {
+            chain_id: 1,
+            nonce: 1,
+            gas_price: U256::from(1u64),
+            gas_limit: 21000,
+            to: TxKind::Create,
+            value: U256::zero(),
+            data: Bytes::from_static(b"data"),
+            access_list: vec![],
+            v: U256::from(1u64),
+            sig: Bytes::from_static(b"sig"),
+            ..Default::default()
+        };
 
-        // 2. Generate a valid low-s signature
-        // k256's sign_prehash_recoverable produces canonical low-s signatures by default.
-        // We use the pre-calculated hash (payload).
-        let (signature, recovery_id) = signing_key
-            .sign_prehash_recoverable(payload.as_bytes())
-            .expect("Signing failed");
+        let tx_to_serialize = Transaction::EIP2930Transaction(tx.clone());
+        let serialized = serde_json::to_string(&tx_to_serialize).expect("Failed to serialize");
+        let deserialized_tx: Transaction =
+            serde_json::from_str(&serialized).expect("Failed to deserialize");
+        assert_eq!(deserialized_tx, Transaction::EIP2930Transaction(tx));
+    }
 
-        // 3. Construct the signature bytes expected by recover_address
-        // Format: [r (32 bytes), s (32 bytes), v (1 byte)]
-        let mut sig_bytes = [0u8; 65];
-        sig_bytes[..64].copy_from_slice(&signature.to_bytes());
-        sig_bytes[64] = recovery_id.to_byte();
-
-        // 4. Verify that the valid low-s signature recovers the correct address
-        // Calculate the expected address from the public key
-        let uncompressed_pub = signing_key.verifying_key().to_encoded_point(false);
-        let pub_hash = ethrex_crypto::keccak::keccak_hash(&uncompressed_pub.as_bytes()[1..]);
-        let expected_address = Address::from_slice(&pub_hash[12..]);
-
-        let recovered = recover_address(Signature::from_slice(&sig_bytes), payload)
-            .expect("Valid low-s signature should recover successfully");
-        assert_eq!(recovered, expected_address, "Recovered address mismatch");
-
-        // 5. Create a high-s signature: s' = N - s
-        // The curve order N for secp256k1
-        let n = U256::from_big_endian(&hex!(
-            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"
-        ));
-        let s = U256::from_big_endian(&sig_bytes[32..64]);
-
-        // Ensure the generated signature was indeed low-s (standard requirement)
-        let half_n = n / 2;
-        assert!(
-            s <= half_n,
-            "Generated signature was not low-s, cannot test high-s rejection"
-        );
-
-        // Calculate high-s
-        let s_high = n - s;
-
-        let mut sig_high_bytes = sig_bytes;
-        // Replace s with s_high
-        sig_high_bytes[32..64].copy_from_slice(&s_high.to_big_endian());
-        // When flipping s to -s mod N, we must also flip the recovery ID (v) to maintain validity of the point R
-        sig_high_bytes[64] ^= 1;
-
-        // 6. Verify that the high-s signature is rejected
-        // EIP-2 requires rejecting s > N/2 to prevent malleability
-        assert!(
-            recover_address(Signature::from_slice(&sig_high_bytes), payload).is_err(),
-            "High-s signature should be rejected (EIP-2 compliance)"
-        );
+    #[test]
+    fn tx_chain_id_v_field() {
+        let tx = LegacyTransaction {
+            nonce: 0,
+            gas_price: U256::from(1u64),
+            gas: 21000,
+            to: TxKind::Create,
+            value: U256::zero(),
+            data: Bytes::new(),
+            v: U256::from(321u64),
+            sig: Bytes::from_static(b"sig"),
+            ..Default::default()
+        };
+        let tx = Transaction::LegacyTransaction(tx);
+        assert_eq!(tx.chain_id(), Some(321));
+        assert!(tx.protected());
     }
 
     #[test]
@@ -3648,7 +3483,11 @@ mod tests {
 
     #[test]
     fn test_eip1559_simple_transfer_size() {
-        let tx = Transaction::EIP1559Transaction(EIP1559Transaction::default());
+        let tx = Transaction::EIP1559Transaction(EIP1559Transaction {
+            sig: Bytes::from(vec![0u8; SIG_WITH_PUBKEY_LEN]),
+            v: U256::zero(),
+            ..Default::default()
+        });
         assert_eq!(tx.encode_to_vec().len(), EIP1559_DEFAULT_SERIALIZED_LENGTH);
     }
 }

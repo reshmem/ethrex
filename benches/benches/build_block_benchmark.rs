@@ -166,7 +166,7 @@ async fn fill_mempool(b: &Blockchain, accounts: Vec<SecretKey>) {
                 gas_limit: 250000_u64,
                 max_fee_per_gas: u64::MAX,
                 max_priority_fee_per_gas: 10_u64,
-                chain_id: 9,
+                chain_id: 4062024,
                 to: TxKind::Call(H160::random()),
                 ..Default::default()
             });

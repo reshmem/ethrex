@@ -88,3 +88,8 @@ dev_ethrex_l2/
 
 # Logs
 logs/
+ethrex.log
+ethrex-*.log
+
+# Test database artifacts
+crates/storage/store-test-db-*/

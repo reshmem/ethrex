@@ -496,12 +496,17 @@ impl Blockchain {
             .get_fork_blob_schedule(context.payload.header.timestamp)
             .map(|schedule| schedule.max)
             .unwrap_or_default() as usize;
+        let max_txs_per_block = chain_config.max_txs_per_block as usize;
 
         debug!("Fetching transactions from mempool");
         // Fetch mempool transactions
         let (mut plain_txs, mut blob_txs) = self.fetch_mempool_transactions(context)?;
         // Execute and add transactions to payload (if suitable)
         loop {
+            if context.payload.body.transactions.len() >= max_txs_per_block {
+                debug!("Reached max transactions per block: {}", max_txs_per_block);
+                break;
+            }
             // Check if we have enough gas to run more transactions
             if context.remaining_gas < TX_GAS_COST {
                 debug!("No more gas to run transactions");

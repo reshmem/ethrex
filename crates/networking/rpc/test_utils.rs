@@ -12,6 +12,7 @@ use ethrex_common::{
         LegacyTransaction, Transaction, TxKind,
     },
 };
+use ethrex_crypto::slh_dsa::SIG_WITH_PUBKEY_LEN;
 use ethrex_p2p::{
     discv4::peer_table::{PeerTable, TARGET_PEERS},
     network::P2PContext,
@@ -22,7 +23,6 @@ use ethrex_p2p::{
     types::{Node, NodeRecord},
 };
 use ethrex_storage::{EngineType, Store};
-use hex_literal::hex;
 use secp256k1::SecretKey;
 use spawned_concurrency::tasks::{GenServer, GenServerHandle};
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
@@ -105,7 +105,7 @@ async fn add_blocks_with_transactions(
 }
 
 fn legacy_tx_for_test(nonce: u64) -> Transaction {
-    Transaction::LegacyTransaction(LegacyTransaction {
+    let mut tx = LegacyTransaction {
         nonce,
         gas_price: U256::from(nonce) * U256::from(BASE_PRICE_IN_WEI),
         gas: 10000,
@@ -113,17 +113,14 @@ fn legacy_tx_for_test(nonce: u64) -> Transaction {
         value: 100.into(),
         data: Default::default(),
         v: U256::from(0x1b),
-        r: U256::from_big_endian(&hex!(
-            "7e09e26678ed4fac08a249ebe8ed680bf9051a5e14ad223e4b2b9d26e0208f37"
-        )),
-        s: U256::from_big_endian(&hex!(
-            "5f6e3f188e3e6eab7d7d3b6568f5eac7d687b08d307d3154ccd8c87b4630509b"
-        )),
+        sig: Bytes::new(),
         ..Default::default()
-    })
+    };
+    tx.sig = Bytes::from(vec![0u8; SIG_WITH_PUBKEY_LEN]);
+    Transaction::LegacyTransaction(tx)
 }
 fn eip1559_tx_for_test(nonce: u64) -> Transaction {
-    Transaction::EIP1559Transaction(EIP1559Transaction {
+    let mut tx = EIP1559Transaction {
         chain_id: 1,
         nonce,
         max_fee_per_gas: nonce * BASE_PRICE_IN_WEI,
@@ -136,11 +133,12 @@ fn eip1559_tx_for_test(nonce: u64) -> Transaction {
         value: 100.into(),
         data: Default::default(),
         access_list: vec![],
-        signature_y_parity: true,
-        signature_r: U256::default(),
-        signature_s: U256::default(),
+        v: U256::from(1u64),
+        sig: Bytes::new(),
         ..Default::default()
-    })
+    };
+    tx.sig = Bytes::from(vec![0u8; SIG_WITH_PUBKEY_LEN]);
+    Transaction::EIP1559Transaction(tx)
 }
 
 pub async fn setup_store() -> Store {

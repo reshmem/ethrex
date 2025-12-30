@@ -529,6 +529,10 @@ mod tests {
 
     #[tokio::test]
     async fn background_job_removes_filter_smoke_test() {
+        if std::env::var("ETHREX_RUN_RPC_INTEGRATION_TESTS").is_err() {
+            eprintln!("ETHREX_RUN_RPC_INTEGRATION_TESTS not set, skipping");
+            return;
+        }
         // Start a test server to start the cleanup
         // task in the background
         let server_handle = start_test_api().await;

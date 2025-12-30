@@ -401,11 +401,12 @@ impl Syncer {
                     .await?
                     .ok_or(SyncError::BodiesNotFound)?;
                 debug!("Obtained: {} block bodies", bodies.len());
-                let block_batch = headers
-                    .drain(..bodies.len())
-                    .zip(bodies)
-                    .map(|(header, body)| Block { header, body });
-                blocks.extend(block_batch);
+                let mut matched_hashes = HashSet::with_capacity(bodies.len());
+                for (header, body) in bodies {
+                    matched_hashes.insert(header.hash());
+                    blocks.push(Block { header, body });
+                }
+                headers.retain(|header| !matched_hashes.contains(&header.hash()));
             }
             if !blocks.is_empty() {
                 // Execute blocks
@@ -566,15 +567,12 @@ async fn store_block_bodies(
         debug!("Requesting Block Bodies ");
         if let Some(block_bodies) = peers.request_block_bodies(&block_headers).await? {
             debug!(" Received {} Block Bodies", block_bodies.len());
-            // Track which bodies we have already fetched
-            let current_block_headers = block_headers.drain(..block_bodies.len());
-            // Add bodies to storage
-            for (hash, body) in current_block_headers
-                .map(|h| h.hash())
-                .zip(block_bodies.into_iter())
-            {
-                store.add_block_body(hash, body).await?;
+            let mut matched_hashes = HashSet::with_capacity(block_bodies.len());
+            for (block_header, body) in block_bodies {
+                matched_hashes.insert(block_header.hash());
+                store.add_block_body(block_header.hash(), body).await?;
             }
+            block_headers.retain(|header| !matched_hashes.contains(&header.hash()));
 
             // Check if we need to ask for another batch
             if block_headers.is_empty() {

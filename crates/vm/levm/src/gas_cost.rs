@@ -172,7 +172,7 @@ pub const ACCESS_LIST_STORAGE_KEY_COST: u64 = 1900;
 pub const ACCESS_LIST_ADDRESS_COST: u64 = 2400;
 
 // Precompile costs
-pub const ECRECOVER_COST: u64 = 3000;
+pub const SLHRECOVER_COST: u64 = 3000;
 pub const BLS12_381_G1ADD_COST: u64 = 375;
 pub const BLS12_381_G2ADD_COST: u64 = 600;
 pub const BLS12_381_MAP_FP_TO_G1_COST: u64 = 5500;

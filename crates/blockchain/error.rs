@@ -84,6 +84,8 @@ pub enum InvalidBlockError {
     ExceededMaxBlobGasPerBlock,
     #[error("Exceeded MAX_BLOB_NUMBER_PER_BLOCK")]
     ExceededMaxBlobNumberPerBlock,
+    #[error("Exceeded max transactions per block: max {max}, got {got}")]
+    ExceededMaxTransactionsPerBlock { max: u64, got: u64 },
     #[error("Gas used doesn't match value in header. Used: {0}, Expected: {1}")]
     GasUsedMismatch(u64, u64),
     #[error("Blob gas used doesn't match value in header")]

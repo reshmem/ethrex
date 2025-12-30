@@ -36,39 +36,122 @@ pub fn chain_file(file: File) -> Result<Vec<Block>, Error> {
 #[cfg(test)]
 mod tests {
     use crate::decode::chain_file;
-    use ethrex_common::H256;
-    use std::{fs::File, str::FromStr as _};
+    use ethrex_common::{
+        constants::DEFAULT_OMMERS_HASH,
+        types::{
+            compute_receipts_root, compute_transactions_root, compute_withdrawals_root, Block,
+            BlockBody, BlockHeader,
+        },
+        Address, Bloom, H256, U256,
+    };
+    use ethrex_rlp::encode::RLPEncode as _;
+    use std::{
+        fs::File,
+        io::Write as _,
+        path::PathBuf,
+    };
+
+    fn build_test_chain(count: usize) -> Vec<Block> {
+        let mut blocks = Vec::with_capacity(count);
+        let mut parent_hash = H256::zero();
+
+        for number in 1..=count {
+            let body = BlockBody {
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: Some(Vec::new()),
+            };
+            let transactions_root = compute_transactions_root(&body.transactions);
+            let receipts_root = compute_receipts_root(&[]);
+            let withdrawals_root = Some(compute_withdrawals_root(
+                body.withdrawals.as_ref().expect("withdrawals set"),
+            ));
+
+            let header = BlockHeader {
+                hash: Default::default(),
+                parent_hash,
+                ommers_hash: *DEFAULT_OMMERS_HASH,
+                coinbase: Address::zero(),
+                state_root: H256::zero(),
+                transactions_root,
+                receipts_root,
+                logs_bloom: Bloom::default(),
+                difficulty: U256::zero(),
+                number: number as u64,
+                gas_limit: 0,
+                gas_used: 0,
+                timestamp: number as u64,
+                extra_data: Default::default(),
+                prev_randao: H256::zero(),
+                nonce: 0,
+                base_fee_per_gas: Some(0),
+                withdrawals_root,
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                parent_beacon_block_root: None,
+                requests_hash: None,
+            };
+
+            let block = Block::new(header, body);
+            parent_hash = block.hash();
+            blocks.push(block);
+        }
+
+        blocks
+    }
 
     #[test]
     fn decode_chain_file() {
-        let file =
-            File::open("../../fixtures/blockchain/chain.rlp").expect("Failed to open chain file");
+        let expected_blocks = build_test_chain(20);
+        let mut path = PathBuf::from(std::env::temp_dir());
+        path.push("ethrex-test-chain.rlp");
+
+        {
+            let mut file = File::create(&path).expect("Failed to create chain file");
+            for block in &expected_blocks {
+                file.write_all(&block.encode_to_vec())
+                    .expect("Failed to write chain file");
+            }
+        }
+
+        let file = File::open(&path).expect("Failed to open chain file");
         let blocks = chain_file(file).expect("Failed to decode chain file");
+        let _ = std::fs::remove_file(&path);
+
         assert_eq!(20, blocks.len(), "There should be 20 blocks in chain file");
         assert_eq!(
             1,
             blocks.first().unwrap().header.number,
             "first block should be number 1"
         );
-        // Just checking some block hashes.
-        // May add more asserts in the future.
         assert_eq!(
-            H256::from_str("0xac5c61edb087a51279674fe01d5c1f65eac3fd8597f9bea215058e745df8088e")
-                .unwrap(),
+            expected_blocks.first().unwrap().hash(),
             blocks.first().unwrap().hash(),
             "First block hash does not match"
         );
         assert_eq!(
-            H256::from_str("0xa111ce2477e1dd45173ba93cac819e62947e62a63a7d561b6f4825fb31c22645")
-                .unwrap(),
+            expected_blocks.get(1).unwrap().hash(),
             blocks.get(1).unwrap().hash(),
             "Second block hash does not match"
         );
         assert_eq!(
-            H256::from_str("0x8f64c4436f7213cfdf02cfb9f45d012f1774dfb329b8803de5e7479b11586902")
-                .unwrap(),
-            blocks.get(19).unwrap().hash(),
+            expected_blocks.last().unwrap().hash(),
+            blocks.last().unwrap().hash(),
             "Last block hash does not match"
         );
+    }
+
+    #[test]
+    #[ignore = "one-off fixture regeneration"]
+    fn update_chain_fixture() {
+        let blocks = build_test_chain(20);
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("../../fixtures/blockchain/chain.rlp");
+
+        let mut file = File::create(&path).expect("Failed to create chain file");
+        for block in &blocks {
+            file.write_all(&block.encode_to_vec())
+                .expect("Failed to write chain file");
+        }
     }
 }

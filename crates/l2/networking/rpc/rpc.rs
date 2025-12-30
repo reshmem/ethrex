@@ -41,13 +41,13 @@ use tracing_subscriber::{EnvFilter, Registry, reload};
 use crate::l2::transaction::SponsoredTx;
 use ethrex_common::Address;
 use ethrex_storage_rollup::StoreRollup;
-use secp256k1::SecretKey;
+use ethrex_l2_common::account_key::AccountPrivateKey;
 
 #[derive(Debug, Clone)]
 pub struct RpcApiContext {
     pub l1_ctx: ethrex_rpc::RpcApiContext,
     pub valid_delegation_addresses: Vec<Address>,
-    pub sponsor_pk: SecretKey,
+    pub sponsor_key: AccountPrivateKey,
     pub rollup_store: StoreRollup,
 }
 
@@ -83,7 +83,7 @@ pub async fn start_api(
     peer_handler: Option<PeerHandler>,
     client_version: String,
     valid_delegation_addresses: Vec<Address>,
-    sponsor_pk: SecretKey,
+    sponsor_key: AccountPrivateKey,
     rollup_store: StoreRollup,
     log_filter_handler: Option<reload::Handle<EnvFilter, Registry>>,
     gas_ceil: u64,
@@ -112,7 +112,7 @@ pub async fn start_api(
             block_worker_channel,
         },
         valid_delegation_addresses,
-        sponsor_pk,
+        sponsor_key,
         rollup_store,
     };
 

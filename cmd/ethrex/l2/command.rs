@@ -19,8 +19,13 @@ use ethrex_common::{
 };
 use ethrex_common::{types::BlobsBundle, utils::keccak};
 use ethrex_config::networks::Network;
+use ethrex_crypto::slh_dsa::generate_slh_key;
 use ethrex_l2::utils::state_reconstruct::get_batch;
-use ethrex_l2_common::calldata::Value;
+use ethrex_l2_common::{
+    account_key::AccountPrivateKey,
+    calldata::Value,
+    keystore::AccountKeystore,
+};
 use ethrex_l2_sdk::call_contract;
 use ethrex_rlp::decode::RLPDecode as _;
 use ethrex_rpc::{
@@ -270,6 +275,68 @@ pub enum Command {
         #[command(flatten)]
         options: DeployerOptions,
     },
+    #[command(about = "Manage account keystores for SLH or legacy keys.")]
+    Keystore {
+        #[command(subcommand)]
+        command: KeystoreCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KeystoreCommand {
+    #[command(about = "Create an SLH keystore (generate or import a key).")]
+    Create {
+        #[arg(
+            long,
+            value_name = "KEYSTORE_PATH",
+            help = "Path to write the keystore JSON file."
+        )]
+        output: PathBuf,
+        #[arg(
+            long,
+            value_name = "PASSWORD",
+            env = "ETHREX_KEYSTORE_PASSWORD",
+            help = "Password to encrypt the keystore."
+        )]
+        password: String,
+        #[arg(
+            long = "slh-private-key",
+            value_name = "PRIVATE_KEY_HEX",
+            env = "ETHREX_SLH_PRIVATE_KEY",
+            help = "Hex-encoded SLH private key (128 bytes). If omitted, a new key is generated.",
+            conflicts_with = "generate"
+        )]
+        slh_private_key: Option<String>,
+        #[arg(
+            long,
+            action = clap::ArgAction::SetTrue,
+            help = "Generate a new SLH private key."
+        )]
+        generate: bool,
+    },
+    #[command(about = "Migrate a legacy secp256k1 key into a keystore.")]
+    MigrateLegacy {
+        #[arg(
+            long,
+            value_name = "KEYSTORE_PATH",
+            help = "Path to write the keystore JSON file."
+        )]
+        output: PathBuf,
+        #[arg(
+            long,
+            value_name = "PASSWORD",
+            env = "ETHREX_KEYSTORE_PASSWORD",
+            help = "Password to encrypt the keystore."
+        )]
+        password: String,
+        #[arg(
+            long = "legacy-private-key",
+            value_parser = parse_private_key,
+            env = "ETHREX_LEGACY_PRIVATE_KEY",
+            help = "Hex-encoded legacy secp256k1 private key."
+        )]
+        legacy_private_key: SecretKey,
+    },
 }
 
 impl Command {
@@ -374,6 +441,61 @@ impl Command {
                     }
 
                     current_block += U256::one();
+                }
+            }
+            Command::Keystore { command } => {
+                match command {
+                    KeystoreCommand::Create {
+                        output,
+                        password,
+                        slh_private_key,
+                        generate,
+                    } => {
+                        if let Some(parent) = output.parent() {
+                            if !parent.as_os_str().is_empty() {
+                                create_dir_all(parent)?;
+                            }
+                        }
+                        let slh_key = if let Some(hex_key) = slh_private_key {
+                            let bytes = utils::parse_hex(&hex_key)?;
+                            let account_key = AccountPrivateKey::from_bytes(bytes.as_ref())
+                                .map_err(|e| eyre::eyre!("Invalid SLH key: {e}"))?;
+                            account_key
+                                .slh_private_key()
+                                .ok_or_else(|| eyre::eyre!("Provided key is not SLH"))?
+                                .clone()
+                        } else if generate {
+                            generate_slh_key().0
+                        } else {
+                            return Err(eyre::eyre!(
+                                "Provide --slh-private-key or --generate"
+                            ));
+                        };
+                        let keystore = AccountKeystore::encrypt_slh(&slh_key, &password)?;
+                        keystore.write_to_file(&output)?;
+                        let address = AccountPrivateKey::from(slh_key).address();
+                        println!("Keystore written to {output:?}");
+                        println!("Address: {address:#x}");
+                    }
+                    KeystoreCommand::MigrateLegacy {
+                        output,
+                        password,
+                        legacy_private_key,
+                    } => {
+                        if let Some(parent) = output.parent() {
+                            if !parent.as_os_str().is_empty() {
+                                create_dir_all(parent)?;
+                            }
+                        }
+                        let keystore = AccountKeystore::encrypt_legacy(
+                            &legacy_private_key.secret_bytes(),
+                            &password,
+                        )?;
+                        keystore.write_to_file(&output)?;
+                        let address = AccountPrivateKey::from(legacy_private_key).address();
+                        println!("Keystore written to {output:?}");
+                        println!("Address: {address:#x}");
+                    }
                 }
             }
             Command::Reconstruct {
@@ -666,6 +788,8 @@ impl ContractCallOptions {
         let client = EthClient::new(self.rpc_url.clone())?;
         let signer = parse_signer(
             self.private_key,
+            None,
+            None,
             self.remote_signer_url.clone(),
             self.remote_signer_public_key,
         )?;

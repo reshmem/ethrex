@@ -265,7 +265,13 @@ impl L1ProofSender {
             ));
         };
 
-        let wallet = Wallet::from_bytes(local_signer.private_key.as_ref())
+        let legacy_key = local_signer
+            .private_key
+            .legacy_secp_bytes()
+            .ok_or_else(|| {
+                ProofSenderError::UnexpectedError("Expected legacy secp signer".to_string())
+            })?;
+        let wallet = Wallet::from_bytes(legacy_key.as_slice())
             .map_err(|_| ProofSenderError::UnexpectedError("Failed to create wallet".to_owned()))?;
 
         let wallet = wallet.with_chain_id(self.l1_chain_id);

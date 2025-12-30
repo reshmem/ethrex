@@ -30,6 +30,11 @@ use std::fs;
 // - Each block contains exactly 10 deposit transactions
 #[tokio::test]
 async fn test_state_reconstruct() {
+    if std::env::var("ETHREX_RUN_L2_INTEGRATION_TESTS").is_err() {
+        eprintln!("ETHREX_RUN_L2_INTEGRATION_TESTS not set, skipping");
+        return;
+    }
+
     let pks_path = std::env::var("PRIVATE_KEYS_PATH")
         .unwrap_or("../../fixtures/keys/private_keys_l1.txt".to_string());
     let pks = fs::read_to_string(&pks_path).unwrap();

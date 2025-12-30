@@ -2777,12 +2777,15 @@ mod tests {
     use bytes::Bytes;
     use ethereum_types::{H256, U256};
     use ethrex_common::{
-        Bloom, H160,
+        Address, Bloom, H160,
         constants::EMPTY_KECCACK_HASH,
-        types::{Transaction, TxType},
+        types::{
+            BlockBody, EIP1559Transaction, LegacyTransaction, Transaction, TxKind, TxType,
+            compute_transactions_root,
+        },
         utils::keccak,
     };
-    use ethrex_rlp::decode::RLPDecode;
+    use ethrex_crypto::slh_dsa::SIG_WITH_PUBKEY_LEN;
     use std::{fs, str::FromStr};
 
     use super::*;
@@ -2955,7 +2958,7 @@ mod tests {
     }
 
     fn create_block_for_testing() -> (BlockHeader, BlockBody) {
-        let block_header = BlockHeader {
+        let mut block_header = BlockHeader {
             parent_hash: H256::from_str(
                 "0x1ac1bf1eef97dc6b03daba5af3b89881b7ae4bc1600dc434f450a9ec34d44999",
             )
@@ -2969,10 +2972,7 @@ mod tests {
                 "0x9de6f95cb4ff4ef22a73705d6ba38c4b927c7bca9887ef5d24a734bb863218d9",
             )
             .unwrap(),
-            transactions_root: H256::from_str(
-                "0x578602b2b7e3a3291c3eefca3a08bc13c0d194f9845a39b6f3bcf843d9fed79d",
-            )
-            .unwrap(),
+            transactions_root: H256::zero(),
             receipts_root: H256::from_str(
                 "0x035d56bac3f47246c5eed0e6642ca40dc262f9144b582f058bc23ded72aa72fa",
             )
@@ -2999,12 +2999,38 @@ mod tests {
             requests_hash: Some(*EMPTY_KECCACK_HASH),
             ..Default::default()
         };
+        let sig = Bytes::from(vec![0u8; SIG_WITH_PUBKEY_LEN]);
+        let legacy_tx = Transaction::LegacyTransaction(LegacyTransaction {
+            nonce: 0,
+            gas_price: U256::from(1),
+            gas: 21_000,
+            to: TxKind::Call(Address::from_low_u64_be(1)),
+            value: U256::zero(),
+            data: Bytes::new(),
+            v: U256::from(1),
+            sig: sig.clone(),
+            ..Default::default()
+        });
+        let eip1559_tx = Transaction::EIP1559Transaction(EIP1559Transaction {
+            chain_id: 1,
+            nonce: 1,
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 1,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::from_low_u64_be(2)),
+            value: U256::zero(),
+            data: Bytes::new(),
+            access_list: Default::default(),
+            v: U256::from(1),
+            sig,
+            ..Default::default()
+        });
         let block_body = BlockBody {
-            transactions: vec![Transaction::decode(&hex::decode("b86f02f86c8330182480114e82f618946177843db3138ae69679a54b95cf345ed759450d870aa87bee53800080c080a0151ccc02146b9b11adf516e6787b59acae3e76544fdcd75e77e67c6b598ce65da064c5dd5aae2fbb535830ebbdad0234975cd7ece3562013b63ea18cc0df6c97d4").unwrap()).unwrap(),
-            Transaction::decode(&hex::decode("f86d80843baa0c4082f618946177843db3138ae69679a54b95cf345ed759450d870aa87bee538000808360306ba0151ccc02146b9b11adf516e6787b59acae3e76544fdcd75e77e67c6b598ce65da064c5dd5aae2fbb535830ebbdad0234975cd7ece3562013b63ea18cc0df6c97d4").unwrap()).unwrap()],
+            transactions: vec![eip1559_tx, legacy_tx],
             ommers: Default::default(),
             withdrawals: Default::default(),
         };
+        block_header.transactions_root = compute_transactions_root(&block_body.transactions);
         (block_header, block_body)
     }
 

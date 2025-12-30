@@ -133,7 +133,7 @@ mod tests {
     #[tokio::test]
     async fn test_for_legacy_txs() {
         let storage = setup_store().await;
-        add_legacy_tx_blocks(&storage, 20, 10).await;
+        add_legacy_tx_blocks(&storage, 21, 3).await;
         let gas_tip = GasTipEstimator::new()
             .estimate_gas_tip(&storage)
             .await
@@ -144,7 +144,7 @@ mod tests {
     #[tokio::test]
     async fn test_for_eip1559_txs() {
         let storage = setup_store().await;
-        add_eip1559_tx_blocks(&storage, 20, 10).await;
+        add_eip1559_tx_blocks(&storage, 21, 3).await;
         let gas_tip = GasTipEstimator::new()
             .estimate_gas_tip(&storage)
             .await
@@ -155,7 +155,7 @@ mod tests {
     #[tokio::test]
     async fn test_for_mixed_txs() {
         let storage = setup_store().await;
-        add_mixed_tx_blocks(&storage, 20, 10).await;
+        add_mixed_tx_blocks(&storage, 21, 3).await;
         let gas_tip = GasTipEstimator::new()
             .estimate_gas_tip(&storage)
             .await
@@ -176,7 +176,7 @@ mod tests {
     #[tokio::test]
     async fn test_for_empty_blocks() {
         let storage = setup_store().await;
-        add_empty_blocks(&storage, 20).await;
+        add_empty_blocks(&storage, 21).await;
         let gas_tip = GasTipEstimator::new()
             .estimate_gas_tip(&storage)
             .await
